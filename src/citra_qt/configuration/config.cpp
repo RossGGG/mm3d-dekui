@@ -4,12 +4,16 @@
 
 #include <algorithm>
 #include <array>
+#ifndef DEKUI_CONFIG_QTCORE_ONLY
 #include <QKeySequence>
+#endif
 #include <QSettings>
 #include <QVariant>
 #include <QVector>
 #include "citra_qt/configuration/config.h"
+#ifndef DEKUI_CONFIG_QTCORE_ONLY
 #include "citra_qt/fullscreen_shortcut.h"
+#endif
 #include "citra_qt/setting_qkeys.h"
 #include "common/file_util.h"
 #include "common/settings.h"
@@ -77,7 +81,12 @@ const std::vector<UISettings::Shortcut> QtConfig::default_hotkeys{ {
      {QStringLiteral("Decrease Speed Limit"),     QStringLiteral("Main Window"), {QStringLiteral("-"),      QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Exit Azahar"),              QStringLiteral("Main Window"), {QStringLiteral("Ctrl+Q"), QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Exit Fullscreen"),          QStringLiteral("Main Window"), {QStringLiteral("Esc"),    QStringLiteral(""), Qt::ApplicationShortcut}},
+#ifdef DEKUI_CONFIG_QTCORE_ONLY
+     // The SwiftUI app has no window shortcuts; keep the saved entry intact.
+     {QStringLiteral("Fullscreen"),               QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
+#else
      {QStringLiteral("Fullscreen"),               QStringLiteral("Main Window"), {DefaultFullscreenShortcut().toString(QKeySequence::NativeText),    QStringLiteral(""), Qt::ApplicationShortcut}},
+#endif
      {QStringLiteral("Increase 3D Factor"),       QStringLiteral("Main Window"), {QStringLiteral("Ctrl++"), QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Increase Speed Limit"),     QStringLiteral("Main Window"), {QStringLiteral("+"),      QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Load Amiibo"),              QStringLiteral("Main Window"), {QStringLiteral("F2"),     QStringLiteral(""), Qt::ApplicationShortcut}},
@@ -345,6 +354,8 @@ void QtConfig::ReadControlValues() {
     qt_config->beginGroup(QStringLiteral("Controls"));
 
     ReadBasicSetting(Settings::values.use_artic_base_controller);
+    ReadBasicSetting(Settings::values.motion_source);
+    ReadBasicSetting(Settings::values.motion_sensitivity);
 
     UISettings::values.controller_hotkey_maptype = static_cast<Settings::InputMappingType>(
         ReadSetting(Settings::QKeys::controller_hotkey_maptype,
@@ -1011,6 +1022,8 @@ void QtConfig::SaveControlValues() {
     qt_config->beginGroup(QStringLiteral("Controls"));
 
     WriteBasicSetting(Settings::values.use_artic_base_controller);
+    WriteBasicSetting(Settings::values.motion_source);
+    WriteBasicSetting(Settings::values.motion_sensitivity);
     WriteSetting(Settings::QKeys::controller_hotkey_maptype,
                  static_cast<int>(UISettings::values.controller_hotkey_maptype.GetValue()),
                  static_cast<int>(Settings::InputMappingType::GuidPort));

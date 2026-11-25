@@ -12,6 +12,9 @@
 #include <QWidget>
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
+#ifdef ENABLE_MM3D_GAME_FOLDER
+#include "dekui_frontend/input.h"
+#endif
 
 class QKeyEvent;
 class QTouchEvent;
@@ -183,9 +186,13 @@ signals:
     /// Emitted on mouse activity. Used to signal that the mouse should be shown if it's hidden
     void MouseActivity();
 
+    /// A save state shortcut was pressed in the game window. `name` is the
+    /// hotkey's name, e.g. "Quick Save".
+    void SaveStateShortcut(const QString& name);
+
 private:
 #ifdef ENABLE_MM3D_GAME_FOLDER
-    u32 settings_touch_x{},settings_touch_y{};
+    Dekui::Input::TouchPointer settings_touch;
 #endif
     void TouchBeginEvent(const QTouchEvent* event);
     void TouchUpdateEvent(const QTouchEvent* event);

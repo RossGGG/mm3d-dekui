@@ -27,10 +27,16 @@
 #include "mm3d/texture_picker.h"
 #include "mm3d/diagnostics.h"
 #include "mm3d/input_latency.h"
-#include "mm3d/player_settings.h"
-#include "core/hle/service/cfg/cfg.h"
+#include "citra_qt/dekui_input.h"
+#include "dekui_frontend/emu_thread.h"
 #endif
 #include "input_common/motion_emu.h"
+#ifdef ENABLE_MM3D_GAME_FOLDER
+#include <algorithm>
+#include <array>
+#include <QKeySequence>
+#include "citra_qt/uisettings.h"
+#endif
 #include "video_core/custom_textures/custom_tex_manager.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
@@ -115,30 +121,11 @@ void EmuThread::run() {
     // next execution step.
     bool was_active = false;
 #ifdef ENABLE_MM3D_PRESENTATION
-    auto game_language_config = Service::CFG::GetModule(system);
-    MM3D::PlayerSettings::game_language.store(game_language_config->GetSystemLanguage());
-    MM3D::PlayerSettings::game_language_status.store(0);
-    const auto apply_game_language = [&] {
-        using namespace MM3D::PlayerSettings;
-        const int requested = set_game_language.exchange(-1);
-        if (!SupportedLanguage(requested)) return;
-        const auto old_language=game_language_config->GetSystemLanguage();
-        game_language_config->SetSystemLanguage(static_cast<Service::CFG::SystemLanguage>(requested));
-        if(game_language_config->GetSystemLanguage()!=requested) {
-            game_language_config->SetSystemLanguage(old_language);
-            game_language_status.store(3);
-            game_language.store(old_language);
-            return;
-        }
-        const auto result=game_language_config->UpdateConfigNANDSavegame();
-        if(!result.IsSuccess())game_language_config->SetSystemLanguage(old_language);
-        game_language_status.store(result.IsSuccess()?2:3);
-        game_language.store(game_language_config->GetSystemLanguage());
-    };
+    Dekui::GameLanguage game_language{system};
 #endif
     while (!stop_run) {
 #ifdef ENABLE_MM3D_PRESENTATION
-        apply_game_language();
+        game_language.ApplyPending();
 #endif
         if (running) {
             if (!was_active)
@@ -177,7 +164,7 @@ void EmuThread::run() {
 
 #ifdef ENABLE_MM3D_PRESENTATION
     // A user may choose a language and quit directly from the paused overlay.
-    apply_game_language();
+    game_language.ApplyPending();
 #endif
     // Shutdown the core emulation
     system.Shutdown();
@@ -442,7 +429,8 @@ static Frontend::WindowSystemType GetWindowSystemType() {
     else if (platform_name == QStringLiteral("wayland") ||
              platform_name == QStringLiteral("wayland-egl"))
         return Frontend::WindowSystemType::Wayland;
-    else if (platform_name == QStringLiteral("cocoa") || platform_name == QStringLiteral("ios"))
+    else if (platform_name == QStringLiteral("cocoa") || platform_name == QStringLiteral("ios") ||
+             platform_name == QStringLiteral("visionos"))
         return Frontend::WindowSystemType::MacOS;
 
     LOG_CRITICAL(Frontend, "Unknown Qt platform!");
@@ -552,7 +540,13 @@ QByteArray GRenderWindow::saveGeometry() {
 }
 
 qreal GRenderWindow::windowPixelRatio() const {
+#ifdef CITRA_VISIONOS
+    // The visionOS Metal layer intentionally presents one drawable pixel per
+    // window point, so layout and pointer coordinates must use the same scale.
+    return 1.0;
+#else
     return devicePixelRatioF();
+#endif
 }
 
 std::pair<u32, u32> GRenderWindow::ScaleTouch(const QPointF pos) const {
@@ -568,19 +562,37 @@ void GRenderWindow::closeEvent(QCloseEvent* event) {
 
 void GRenderWindow::keyPressEvent(QKeyEvent* event) {
 #ifdef ENABLE_MM3D_PRESENTATION
-    if (!is_secondary && (event->key() == Qt::Key_F1
-#ifndef ENABLE_MM3D_GAME_FOLDER
-        || event->key() == Qt::Key_F2
-#endif
-        ) && MM3D::presentation_available.load()) {
-        if (!event->isAutoRepeat()) {
-            MM3D::ToggleOverlayView(event->key()==Qt::Key_F2);
-            TouchReleased();
-            InputCommon::GetMotionEmu()->EndTilt();
-        }
+    if (!is_secondary && Dekui::Input::OverlayToggleKey(ToDekuiKey(event->key()), true,
+                                                        event->isAutoRepeat(), *this)) {
         event->accept();
         return;
     }
+#ifdef ENABLE_MM3D_GAME_FOLDER
+    // Dekui hides Azahar's menus, and Qt does not deliver their action
+    // shortcuts to the game window, so match the save state hotkeys here.
+    if (!is_secondary) {
+        static const std::array<QString, 4> save_state_hotkeys{
+            QStringLiteral("Quick Save"), QStringLiteral("Quick Load"),
+            QStringLiteral("Save to Oldest Non-Quicksave Slot"),
+            QStringLiteral("Load from Newest Non-Quicksave Slot")};
+        for (const auto& shortcut : UISettings::values.shortcuts) {
+            if (shortcut.group != QStringLiteral("Main Window") ||
+                std::find(save_state_hotkeys.begin(), save_state_hotkeys.end(), shortcut.name) ==
+                    save_state_hotkeys.end()) {
+                continue;
+            }
+            const auto sequence =
+                QKeySequence::fromString(shortcut.shortcut.keyseq, QKeySequence::NativeText);
+            if (sequence.count() == 1 && sequence[0] == event->keyCombination()) {
+                if (!event->isAutoRepeat()) {
+                    emit SaveStateShortcut(shortcut.name);
+                }
+                event->accept();
+                return;
+            }
+        }
+    }
+#endif
 #ifndef ENABLE_MM3D_GAME_FOLDER
     if (!is_secondary && event->key() == Qt::Key_C && MM3D::presentation_available.load() &&
         MM3D::overlay_visible.load() && !MM3D::PlayerOverlay() && !event->isAutoRepeat()) {
@@ -591,26 +603,25 @@ void GRenderWindow::keyPressEvent(QKeyEvent* event) {
 #endif
 #endif
 #ifdef ENABLE_MM3D_PRESENTATION
-    if(!event->isAutoRepeat()) MM3D::InputLatency::Key(event->key(),true);
-#endif
+    Dekui::Input::GameKey(event->key(), true, event->isAutoRepeat());
+#else
     InputCommon::GetKeyboard()->PressKey(event->key());
+#endif
 }
 
 void GRenderWindow::keyReleaseEvent(QKeyEvent* event) {
 #ifdef ENABLE_MM3D_PRESENTATION
-    if (!is_secondary && (event->key() == Qt::Key_F1
-#ifndef ENABLE_MM3D_GAME_FOLDER
-        || event->key() == Qt::Key_F2
-#endif
-        ) && MM3D::presentation_available.load()) {
+    if (!is_secondary && Dekui::Input::OverlayToggleKey(ToDekuiKey(event->key()), false,
+                                                        event->isAutoRepeat(), *this)) {
         event->accept();
         return;
     }
 #endif
 #ifdef ENABLE_MM3D_PRESENTATION
-    if(!event->isAutoRepeat()) MM3D::InputLatency::Key(event->key(),false);
-#endif
+    Dekui::Input::GameKey(event->key(), false, event->isAutoRepeat());
+#else
     InputCommon::GetKeyboard()->ReleaseKey(event->key());
+#endif
 }
 
 void GRenderWindow::mousePressEvent(QMouseEvent* event) {
@@ -698,8 +709,7 @@ void GRenderWindow::TouchBeginEvent(const QTouchEvent* event) {
 #ifdef ENABLE_MM3D_GAME_FOLDER
     if(!is_secondary && !event->points().isEmpty()) {
         const auto [x,y]=ScaleTouch(event->points().first().position());
-        settings_touch_x=x;settings_touch_y=y;
-        MM3D::Pointer(x,y,0,true);
+        settings_touch.Begin(x,y);
     }
     return;
 #endif
@@ -712,8 +722,7 @@ void GRenderWindow::TouchUpdateEvent(const QTouchEvent* event) {
 #ifdef ENABLE_MM3D_GAME_FOLDER
     if(!is_secondary && !event->points().isEmpty()) {
         const auto [x,y]=ScaleTouch(event->points().first().position());
-        settings_touch_x=x;settings_touch_y=y;
-        MM3D::Pointer(x,y);
+        settings_touch.Move(x,y);
     }
     return;
 #endif
@@ -736,7 +745,7 @@ void GRenderWindow::TouchUpdateEvent(const QTouchEvent* event) {
 
 void GRenderWindow::TouchEndEvent() {
 #ifdef ENABLE_MM3D_GAME_FOLDER
-    if(!is_secondary)MM3D::Pointer(settings_touch_x,settings_touch_y,0,false);
+    if(!is_secondary)settings_touch.End();
     return;
 #endif
     this->TouchReleased();
@@ -787,6 +796,22 @@ void GRenderWindow::focusInEvent(QFocusEvent* event) {
 
 void GRenderWindow::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
+#ifdef CITRA_VISIONOS
+    // Qt resizes the container when visionOS establishes the window geometry,
+    // but its native child QWindow otherwise remains at the startup size.
+    // Keep the native Metal host in lockstep with the visible render widget.
+    if (child_widget) {
+        child_widget->resize(size());
+        if (QWindow* native_window = child_widget->windowHandle()) {
+            native_window->resize(size());
+        }
+    }
+#endif
+#ifdef __APPLE__
+    if (child_widget && window_info.render_surface) {
+        MetalUtil::ResizeMetalLayer(window_info.render_surface, child_widget->winId());
+    }
+#endif
     OnFramebufferSizeChanged();
 }
 
@@ -837,16 +862,29 @@ bool GRenderWindow::InitRenderTarget() {
         break;
     }
 
-    // Update the Window System information with the new render target
-    window_info = GetWindowSystemInfo(child_widget->windowHandle());
+    // Size the widget before exposing its native view to the renderer. On
+    // visionOS, a newly created native Qt child starts at 160x160 points and
+    // no later QWidget resize event is guaranteed before Vulkan creates its
+    // swapchain.
+#ifdef CITRA_VISIONOS
+    const QSize initial_render_size{640, 360};
+#else
+    const QSize initial_render_size{Core::kScreenTopWidth,
+                                    Core::kScreenTopHeight + Core::kScreenBottomHeight};
+#endif
+    child_widget->resize(initial_render_size);
+#if defined(__APPLE__)
+    child_widget->windowHandle()->resize(child_widget->size());
+#endif
 
-    child_widget->resize(Core::kScreenTopWidth, Core::kScreenTopHeight + Core::kScreenBottomHeight);
+    // Update the Window System information with the new render target.
+    window_info = GetWindowSystemInfo(child_widget->windowHandle());
 
     layout()->addWidget(child_widget);
     // Reset minimum required size to avoid resizing issues on the main window after restarting.
     setMinimumSize(1, 1);
 
-    resize(Core::kScreenTopWidth, Core::kScreenTopHeight + Core::kScreenBottomHeight);
+    resize(initial_render_size);
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     OnFramebufferSizeChanged();
     BackupGeometry();

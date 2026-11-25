@@ -1,12 +1,9 @@
-#ifdef ENABLE_MM3D_GAME_FOLDER
-#include "mm3d/game_folder.h"
-#include "mm3d/game_setup.h"
-#include "mm3d/controller_autoconfig.h"
-#endif
 #ifdef ENABLE_MM3D_PRESENTATION
+#include "dekui_frontend/bootstrap.h"
+#include "dekui_frontend/input.h"
 #include "mm3d/player_settings.h"
-#include "mm3d/player_settings_bridge.h"
 #include "citra_qt/configuration/configure_input.h"
+#include "citra_qt/dekui_input.h"
 #include <QScopedValueRollback>
 #include <QDialogButtonBox>
 #include <QDesktopServices>
@@ -19,7 +16,6 @@
 #ifdef ENABLE_MM3D_PRESENTATION
 #include "mm3d/pause_control.h"
 #include "mm3d/diagnostics.h"
-#include <imgui.h>
 #endif
 #include <iostream>
 #include <memory>
@@ -91,6 +87,14 @@
 #include "citra_qt/loading_screen.h"
 #include "citra_qt/movie/movie_play_dialog.h"
 #include "citra_qt/movie/movie_record_dialog.h"
+#ifdef ENABLE_MM3D_PRESENTATION
+#include "citra_qt/dekui_save_states.h"
+#include "mm3d/notice.h"
+#endif
+#if defined(ENABLE_MM3D_GAME_FOLDER) && defined(__APPLE__) && !defined(CITRA_VISIONOS)
+#include "citra_qt/dekui_app_menu.h"
+#include "dekui_visionos/Bridge/icloud_states.h"
+#endif
 #include "citra_qt/multiplayer/state.h"
 #include "citra_qt/qt_image_interface.h"
 #include "citra_qt/qt_swizzle.h"
@@ -152,6 +156,10 @@ Q_IMPORT_PLUGIN(QWindowsIntegrationPlugin);
 
 #ifdef HAVE_SDL2
 #include <SDL.h>
+#endif
+
+#ifdef CITRA_VISIONOS
+#include <oaknut/apple_jit26.hpp>
 #endif
 
 constexpr int default_mouse_timeout = 2500;
@@ -524,11 +532,27 @@ GMainWindow::GMainWindow(Core::System& system_)
         for(auto* action:menu->actions())action->setShortcut(QKeySequence());
     game_list->hide();
     game_list_placeholder->hide();
-    game_path = MM3D::GameFolder::Rom();
+    game_path = QString::fromStdString(Dekui::GamePath());
 #endif
     show();
+#if defined(ENABLE_MM3D_GAME_FOLDER) && defined(ENABLE_MM3D_PRESENTATION) && defined(__APPLE__) && \
+    !defined(CITRA_VISIONOS)
+    // The native menu bar exists once the window is shown. Open the window on
+    // the next turn of the event loop, outside AppKit's menu handling.
+    QTimer::singleShot(0, this, [this] {
+        const auto game = tr("Game").toStdString();
+        Dekui::AppMenu::AddItem(game, tr("Save States…").toStdString(), "s", [this] {
+            QTimer::singleShot(0, this, [this] { ShowSaveStates(); });
+        });
+        // The same actions as holding ZR and pressing D-Pad Down / Up.
+        Dekui::AppMenu::AddItem(game, tr("New Save State").toStdString(), "n",
+                                [this] { SaveNewState(); });
+        Dekui::AppMenu::AddItem(game, tr("Load Latest Save State").toStdString(), "l",
+                                [this] { LoadLatestState(); });
+    });
+#endif
 
-#ifdef __APPLE__
+#ifdef Q_OS_MACOS
     if (AppleUtils::IsRunningFromTerminal()) {
         QMessageBox::warning(
             this, tr("Warning"),
@@ -976,8 +1000,13 @@ void GMainWindow::InitializeHotkeys() {
     });
     connect_shortcut(QStringLiteral("Toggle Texture Dumping"),
                      [&] { Settings::values.dump_textures = !Settings::values.dump_textures; });
-    connect_shortcut(QStringLiteral("Toggle Custom Textures"),
-                     [&] { MM3D::PlayerSettings::set_textures.store(!Settings::values.custom_textures.GetValue()); });
+    connect_shortcut(QStringLiteral("Toggle Custom Textures"), [&] {
+#ifdef ENABLE_MM3D_PRESENTATION
+        MM3D::PlayerSettings::set_textures.store(!Settings::values.custom_textures.GetValue());
+#else
+        Settings::values.custom_textures = !Settings::values.custom_textures.GetValue();
+#endif
+    });
 
     connect_shortcut(QStringLiteral("Toggle Turbo Mode"),
                      [&] { GMainWindow::SetTurboEnabled(!GMainWindow::IsTurboEnabled()); });
@@ -1055,9 +1084,7 @@ void GMainWindow::RestoreUIState() {
 #ifdef ENABLE_MM3D_GAME_FOLDER
     UISettings::values.single_window_mode=true;
     UISettings::values.show_status_bar=false;
-    // Player builds use the stable audio path; do not inherit Azahar's
-    // audio-stretching default from an existing shared configuration.
-    Settings::values.enable_audio_stretching=false;
+    Dekui::ApplyPlayerDefaults();
 #endif
     ui->action_Single_Window_Mode->setChecked(UISettings::values.single_window_mode.GetValue());
     ToggleWindowMode();
@@ -1117,63 +1144,28 @@ bool GApplicationEventFilter::eventFilter(QObject* object, QEvent* event) {
         event->accept();return true;
     }
 #endif
-    static QSet<int> editing_keys;
-    if (!MM3D::overlay_visible.load()) editing_keys.clear();
+    static Dekui::Input::OverlayKeyboard overlay_keyboard;
     const bool keyboard_event = event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease;
-    const bool editor_focused = MM3D::text_input_active.load() && !QApplication::activeModalWidget();
-    if (keyboard_event && (static_cast<QKeyEvent*>(event)->key() == Qt::Key_F1
-#ifndef ENABLE_MM3D_GAME_FOLDER
-        || static_cast<QKeyEvent*>(event)->key() == Qt::Key_F2
-#endif
-        ))
+    const bool modal_open = QApplication::activeModalWidget() != nullptr;
+    if (keyboard_event &&
+        Dekui::Input::IsOverlayToggleKey(ToDekuiKey(static_cast<QKeyEvent*>(event)->key())))
         return false;
-    if (MM3D::overlay_visible.load() && editor_focused &&
-        event->type() == QEvent::ShortcutOverride) {
+    if (overlay_keyboard.Editing(modal_open) && event->type() == QEvent::ShortcutOverride) {
         event->accept(); // Prevent Space/C and application shortcuts while editing.
         return true;
     }
-    if (MM3D::overlay_visible.load() && keyboard_event &&
-        (editor_focused || (event->type() == QEvent::KeyRelease &&
-                           editing_keys.contains(static_cast<QKeyEvent*>(event)->key())))) {
+    if (keyboard_event) {
         auto* key = static_cast<QKeyEvent*>(event);
-        const bool down = event->type() == QEvent::KeyPress;
-        if (!key->isAutoRepeat()) {
-            if (down) editing_keys.insert(key->key());
-            else editing_keys.remove(key->key());
+        const bool printable = !key->text().isEmpty() && key->text().at(0).isPrint();
+        const auto text = printable ? key->text().toUtf8() : QByteArray{};
+        if (overlay_keyboard.Key(key->key(), ToDekuiKey(key->key()),
+                                 ToDekuiModifiers(key->modifiers()),
+                                 event->type() == QEvent::KeyPress, key->isAutoRepeat(),
+                                 std::string_view{text.constData(), std::size_t(text.size())},
+                                 modal_open)) {
+            event->accept();
+            return true;
         }
-        ImGuiKey mapped = ImGuiKey_None;
-        switch (key->key()) {
-        case Qt::Key_Backspace: mapped = ImGuiKey_Backspace; break;
-        case Qt::Key_Delete: mapped = ImGuiKey_Delete; break;
-        case Qt::Key_Left: mapped = ImGuiKey_LeftArrow; break;
-        case Qt::Key_Right: mapped = ImGuiKey_RightArrow; break;
-        case Qt::Key_Home: mapped = ImGuiKey_Home; break;
-        case Qt::Key_End: mapped = ImGuiKey_End; break;
-        case Qt::Key_Return: case Qt::Key_Enter: mapped = ImGuiKey_Enter; break;
-        case Qt::Key_Escape: mapped = ImGuiKey_Escape; break;
-        case Qt::Key_Tab: mapped = ImGuiKey_Tab; break;
-        default:
-            if (key->key() >= Qt::Key_A && key->key() <= Qt::Key_Z)
-                mapped = ImGuiKey(ImGuiKey_A + key->key() - Qt::Key_A);
-            break;
-        }
-        MM3D::KeyInput(ImGuiMod_Shift, key->modifiers().testFlag(Qt::ShiftModifier));
-#ifdef Q_OS_MAC
-        MM3D::KeyInput(ImGuiMod_Super, key->modifiers().testFlag(Qt::ControlModifier));
-        MM3D::KeyInput(ImGuiMod_Ctrl, key->modifiers().testFlag(Qt::MetaModifier));
-#else
-        MM3D::KeyInput(ImGuiMod_Ctrl, key->modifiers().testFlag(Qt::ControlModifier));
-        MM3D::KeyInput(ImGuiMod_Super, key->modifiers().testFlag(Qt::MetaModifier));
-#endif
-        MM3D::KeyInput(ImGuiMod_Alt, key->modifiers().testFlag(Qt::AltModifier));
-        if (mapped != ImGuiKey_None && !key->isAutoRepeat()) MM3D::KeyInput(mapped, down);
-        if (down && !key->text().isEmpty() && key->text().at(0).isPrint() &&
-            !(key->modifiers() & (Qt::ControlModifier | Qt::MetaModifier))) {
-            const auto text = key->text().toUtf8();
-            MM3D::TextInput(text.constData());
-        }
-        event->accept();
-        return true;
     }
     // Handle the saved fullscreen binding in both desktop and game-folder
     // builds. Consume ShortcutOverride too, avoiding duplicate QAction dispatch.
@@ -1260,141 +1252,11 @@ void GMainWindow::ConnectWidgetEvents() {
 
     connect(&status_bar_update_timer, &QTimer::timeout, this, &GMainWindow::UpdateStatusBar);
 #ifdef ENABLE_MM3D_PRESENTATION
+    Dekui::Host& dekui_host = *this;
+    dekui_poller = std::make_unique<Dekui::Poller>(
+        system, dekui_host, Dekui::KeyboardDefaults{QtConfig::default_buttons, QtConfig::default_analogs});
     auto* inspection_timer = new QTimer(this);
-    connect(inspection_timer, &QTimer::timeout, this, [this, controller_ticks=0u]() mutable {
-#ifdef ENABLE_MM3D_GAME_FOLDER
-        // Retry hotplug and saved automatic profiles; preserve custom bindings.
-        if(controller_ticks++%15==0 && !QApplication::activeModalWidget() &&
-           !Settings::values.use_artic_base_controller.GetValue()) {
-            std::array<std::string,Settings::NativeButton::NumButtons> buttons;
-            std::array<std::string,Settings::NativeAnalog::NumAnalogs> analogs;
-            for(unsigned i=0;i<buttons.size();++i)buttons[i]=InputCommon::GenerateKeyboardParam(QtConfig::default_buttons[i]);
-            for(unsigned i=0;i<analogs.size();++i) {
-                const auto& keys=QtConfig::default_analogs[i];
-                analogs[i]=InputCommon::GenerateAnalogParamFromKeys(keys[0],keys[1],keys[2],keys[3],keys[4],.5f);
-            }
-            using namespace MM3D::ControllerAutoConfig;
-            const auto& current=Settings::values.current_input_profile;
-            auto mapped=Select(current,InputCommon::GetConnectedControllers(),buttons,analogs,
-                InputCommon::GetControllerButtonBinds,InputCommon::GetControllerAnalogBinds);
-            if(mapped) {
-                int index=Settings::values.current_input_profile_index;
-                if(Managed(current,InputCommon::GetControllerButtonBinds,InputCommon::GetControllerAnalogBinds)&&
-                   index>=0&&index<int(Settings::values.input_profiles.size())) {
-                    Settings::values.input_profiles[index]=std::move(*mapped);
-                } else {
-                    // Retain the keyboard profile and all unrelated profiles.
-                    if(index>=0&&index<int(Settings::values.input_profiles.size()))Settings::SaveProfile(index);
-                    index=int(Settings::values.input_profiles.size());
-                    Settings::values.input_profiles.push_back(std::move(*mapped));
-                }
-                Settings::LoadProfile(index);system.ApplySettings();config->Save();
-                LOG_INFO(Frontend,"Automatically configured controller in profile {}",index);
-            }
-        }
-#else
-        (void)controller_ticks;
-#endif
-        using namespace MM3D::PlayerSettings;
-        ApplyPending(Settings::values, [&] { system.ApplySettings(); },
-                     [&] { config->Save(); });
-        if(open_textures.exchange(false)) {
-            const auto path=QString::fromStdString(FileUtil::GetUserPath(FileUtil::UserPath::LoadDir))+
-                QStringLiteral("textures/0004000000125500");
-            if(!QDir().mkpath(path) || !QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
-                QMessageBox::warning(this,tr("Texture folder"),
-                    tr("Could not open the texture folder. You can find it at:\n%1").arg(path));
-        }
-        if(controls.exchange(false)) {
-            const auto old_profiles=Settings::values.input_profiles;
-            const auto old_touch_maps=Settings::values.touch_from_button_maps;
-            const int old_profile=Settings::values.current_input_profile_index;
-            QDialog dialog(this);dialog.setWindowTitle(tr("Dekui controls"));
-            auto* layout=new QVBoxLayout(&dialog);
-            auto* input=new ConfigureInput(system,&dialog);layout->addWidget(input);
-            auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog);
-            layout->addWidget(buttons);
-            connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
-            connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
-            if(dialog.exec()==QDialog::Accepted){input->ApplyConfiguration();input->ApplyProfile();system.ApplySettings();config->Save();}
-            else {Settings::values.input_profiles=old_profiles;Settings::values.touch_from_button_maps=old_touch_maps;Settings::LoadProfile(old_profile);}
-            render_window->setFocus();
-        }
-        const bool texture_binding=textures_shortcut.exchange(false);
-        if(fullscreen_shortcut.exchange(false)||texture_binding) {
-            const QString group=QStringLiteral("Main Window"), action=texture_binding?QStringLiteral("Toggle Custom Textures"):QStringLiteral("Fullscreen");
-            const QKeySequence default_sequence=texture_binding?QKeySequence{}:DefaultFullscreenShortcut();
-            QDialog dialog(this);dialog.setWindowTitle(texture_binding?tr("Custom textures shortcut"):tr("Fullscreen shortcut"));
-            auto* layout=new QVBoxLayout(&dialog);
-            layout->addWidget(new QLabel(texture_binding?tr("Choose a shortcut to toggle custom textures. Leave empty for no shortcut."):tr("Press a key or key combination to toggle fullscreen."),&dialog));
-            auto* edit=new QKeySequenceEdit(hotkey_registry.GetKeySequence(group,action),&dialog);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
-            edit->setMaximumSequenceLength(1);
-#endif
-            layout->addWidget(edit);
-            auto* message=new QLabel(&dialog);message->setWordWrap(true);layout->addWidget(message);
-            auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel|QDialogButtonBox::RestoreDefaults,&dialog);
-            buttons->button(QDialogButtonBox::RestoreDefaults)->setText(texture_binding?tr("Clear shortcut"):tr("Reset to %1").arg(default_sequence.toString(QKeySequence::NativeText)));
-            layout->addWidget(buttons);
-            connect(buttons->button(QDialogButtonBox::RestoreDefaults),&QPushButton::clicked,&dialog,[edit,default_sequence] {
-                edit->setKeySequence(default_sequence);
-            });
-            connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
-            connect(buttons,&QDialogButtonBox::accepted,&dialog,[&,edit,message] {
-                const auto sequence=edit->keySequence();
-                if(texture_binding&&sequence.isEmpty()) {
-                    hotkey_registry.SetKeySequence(group,action,{});
-                    hotkey_registry.SaveHotkeys();config->Save();dialog.accept();return;
-                }
-                if(sequence.count()!=1) {message->setText(tr("Choose one key or key combination."));return;}
-                const auto key=sequence[0].key();
-                if(key==Qt::Key_F1||key==Qt::Key_F2||key==Qt::Key_Escape) {
-                    message->setText(tr("F1, F2 and Escape are reserved. Choose another key."));return;
-                }
-                for(const auto& other:UISettings::values.shortcuts) {
-                    if(other.group==group&&other.name==action)continue;
-                    const auto used=QKeySequence::fromString(other.shortcut.keyseq,QKeySequence::NativeText);
-                    if(!used.isEmpty() && (sequence.matches(used)!=QKeySequence::NoMatch || used.matches(sequence)!=QKeySequence::NoMatch)) {
-                        message->setText(tr("That shortcut is already assigned to %1.").arg(other.name));return;
-                    }
-                }
-                const auto bound=[key](const Common::ParamPackage& p) {
-                    return p.Get("engine", "")=="keyboard" && p.Get("code",0)==int(key);
-                };
-                bool gameplay_key=false;
-                for(const auto& b:Settings::values.current_input_profile.buttons)
-                    gameplay_key|=bound(Common::ParamPackage(b));
-                for(const auto& a:Settings::values.current_input_profile.analogs) {
-                    const Common::ParamPackage analog(a);
-                    if(analog.Get("engine", "")!="analog_from_button")continue;
-                    for(const auto* direction:{"up","down","left","right","modifier"})
-                        gameplay_key|=bound(Common::ParamPackage(analog.Get(direction,"")));
-                }
-                if(gameplay_key && sequence[0].keyboardModifiers()==Qt::NoModifier) {message->setText(tr("That key is assigned to a game control. Choose another key."));return;}
-                hotkey_registry.SetKeySequence(group,action,sequence);
-                hotkey_registry.SaveHotkeys();config->Save();dialog.accept();
-            });
-            edit->setFocus();dialog.exec();render_window->setFocus();
-        }
-        if(fullscreen.exchange(false)) {ui->action_Fullscreen->setChecked(!ui->action_Fullscreen->isChecked());ToggleFullscreen();}
-        if(about.exchange(false)) {
-#ifdef ENABLE_MM3D_GAME_FOLDER
-            QDesktopServices::openUrl(QUrl::fromLocalFile(MM3D::GameFolder::Root()+QStringLiteral("/licenses")));
-#else
-            OnMenuAboutCitra();
-#endif
-        }
-        if(quit.exchange(false)) {
-            // The ImGui Quit button already confirmed this specific close.
-            const QScopedValueRollback<bool> confirmed{close_already_confirmed,true};
-            close();
-        }
-        if (MM3D::step_requested.exchange(false) && system.IsPoweredOn() &&
-            system.frame_limiter.IsFrameAdvancing()) {
-            for (unsigned i = 0; i < MM3D::inspection_step_count.load(); ++i)
-                system.frame_limiter.AdvanceFrame();
-        }
-    });
+    connect(inspection_timer, &QTimer::timeout, this, [this] { dekui_poller->Tick(); });
     inspection_timer->start(16);
 #endif
 
@@ -1405,6 +1267,133 @@ void GMainWindow::ConnectWidgetEvents() {
     connect(this, &GMainWindow::UpdateThemedIcons, multiplayer_state,
             &MultiplayerState::UpdateThemedIcons);
 }
+
+#ifdef ENABLE_MM3D_PRESENTATION
+bool GMainWindow::ModalOpen() const {
+    return QApplication::activeModalWidget() != nullptr;
+}
+
+void GMainWindow::PersistConfig() {
+    config->Save();
+}
+
+void GMainWindow::OpenTextureFolder(const std::string& folder) {
+    const auto path = QString::fromStdString(folder);
+    if (!QDir().mkpath(path) || !QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
+        QMessageBox::warning(this, tr("Texture folder"),
+                             tr("Could not open the texture folder. You can find it at:\n%1").arg(path));
+}
+
+void GMainWindow::ShowLicenses(const std::string& path) {
+    QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(path)));
+}
+
+void GMainWindow::ShowAbout() {
+    OnMenuAboutCitra();
+}
+
+void GMainWindow::ShowControls() {
+    const auto old_profiles=Settings::values.input_profiles;
+    const auto old_touch_maps=Settings::values.touch_from_button_maps;
+    const int old_profile=Settings::values.current_input_profile_index;
+    QDialog dialog(this);dialog.setWindowTitle(tr("Dekui controls"));
+    auto* layout=new QVBoxLayout(&dialog);
+    auto* input=new ConfigureInput(system,&dialog);layout->addWidget(input);
+    auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog);
+    layout->addWidget(buttons);
+    connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
+    connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+    if(dialog.exec()==QDialog::Accepted){input->ApplyConfiguration();input->ApplyProfile();system.ApplySettings();config->Save();}
+    else {Settings::values.input_profiles=old_profiles;Settings::values.touch_from_button_maps=old_touch_maps;Settings::LoadProfile(old_profile);}
+    render_window->setFocus();
+}
+
+void GMainWindow::ShowSaveStates() {
+    DekuiSaveStatesDialog dialog(system, this);
+    dialog.exec();
+    // The hidden Save State menus and the slot hotkeys use the same slots.
+    UpdateSaveStates();
+    render_window->setFocus();
+}
+
+void GMainWindow::SaveNewState() {
+    MM3D::Notice::Show(DekuiSaveNewState(system) ? tr("State saved").toStdString()
+                                                 : tr("Could not save a state now").toStdString());
+}
+
+void GMainWindow::LoadLatestState() {
+    if (!DekuiLoadLatestState(system))
+        MM3D::Notice::Show(tr("No save state to load").toStdString());
+}
+
+void GMainWindow::EditShortcut(Dekui::Shortcut shortcut) {
+    const bool texture_binding = shortcut == Dekui::Shortcut::CustomTextures;
+    const QString group=QStringLiteral("Main Window"), action=texture_binding?QStringLiteral("Toggle Custom Textures"):QStringLiteral("Fullscreen");
+    const QKeySequence default_sequence=texture_binding?QKeySequence{}:DefaultFullscreenShortcut();
+    QDialog dialog(this);dialog.setWindowTitle(texture_binding?tr("Custom textures shortcut"):tr("Fullscreen shortcut"));
+    auto* layout=new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel(texture_binding?tr("Choose a shortcut to toggle custom textures. Leave empty for no shortcut."):tr("Press a key or key combination to toggle fullscreen."),&dialog));
+    auto* edit=new QKeySequenceEdit(hotkey_registry.GetKeySequence(group,action),&dialog);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    edit->setMaximumSequenceLength(1);
+#endif
+    layout->addWidget(edit);
+    auto* message=new QLabel(&dialog);message->setWordWrap(true);layout->addWidget(message);
+    auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel|QDialogButtonBox::RestoreDefaults,&dialog);
+    buttons->button(QDialogButtonBox::RestoreDefaults)->setText(texture_binding?tr("Clear shortcut"):tr("Reset to %1").arg(default_sequence.toString(QKeySequence::NativeText)));
+    layout->addWidget(buttons);
+    connect(buttons->button(QDialogButtonBox::RestoreDefaults),&QPushButton::clicked,&dialog,[edit,default_sequence] {
+        edit->setKeySequence(default_sequence);
+    });
+    connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+    connect(buttons,&QDialogButtonBox::accepted,&dialog,[&,edit,message] {
+        const auto sequence=edit->keySequence();
+        if(texture_binding&&sequence.isEmpty()) {
+            hotkey_registry.SetKeySequence(group,action,{});
+            hotkey_registry.SaveHotkeys();config->Save();dialog.accept();return;
+        }
+        if(sequence.count()!=1) {message->setText(tr("Choose one key or key combination."));return;}
+        const auto key=sequence[0].key();
+        if(key==Qt::Key_F1||key==Qt::Key_F2||key==Qt::Key_Escape) {
+            message->setText(tr("F1, F2 and Escape are reserved. Choose another key."));return;
+        }
+        for(const auto& other:UISettings::values.shortcuts) {
+            if(other.group==group&&other.name==action)continue;
+            const auto used=QKeySequence::fromString(other.shortcut.keyseq,QKeySequence::NativeText);
+            if(!used.isEmpty() && (sequence.matches(used)!=QKeySequence::NoMatch || used.matches(sequence)!=QKeySequence::NoMatch)) {
+                message->setText(tr("That shortcut is already assigned to %1.").arg(other.name));return;
+            }
+        }
+        const auto bound=[key](const Common::ParamPackage& p) {
+            return p.Get("engine", "")=="keyboard" && p.Get("code",0)==int(key);
+        };
+        bool gameplay_key=false;
+        for(const auto& b:Settings::values.current_input_profile.buttons)
+            gameplay_key|=bound(Common::ParamPackage(b));
+        for(const auto& a:Settings::values.current_input_profile.analogs) {
+            const Common::ParamPackage analog(a);
+            if(analog.Get("engine", "")!="analog_from_button")continue;
+            for(const auto* direction:{"up","down","left","right","modifier"})
+                gameplay_key|=bound(Common::ParamPackage(analog.Get(direction,"")));
+        }
+        if(gameplay_key && sequence[0].keyboardModifiers()==Qt::NoModifier) {message->setText(tr("That key is assigned to a game control. Choose another key."));return;}
+        hotkey_registry.SetKeySequence(group,action,sequence);
+        hotkey_registry.SaveHotkeys();config->Save();dialog.accept();
+    });
+    edit->setFocus();dialog.exec();render_window->setFocus();
+}
+
+void GMainWindow::ToggleFullscreenRequested() {
+    ui->action_Fullscreen->setChecked(!ui->action_Fullscreen->isChecked());
+    ToggleFullscreen();
+}
+
+void GMainWindow::Quit() {
+    // The ImGui Quit button already confirmed this specific close.
+    const QScopedValueRollback<bool> confirmed{close_already_confirmed, true};
+    close();
+}
+#endif
 
 void GMainWindow::ConnectMenuEvents() {
     const auto connect_menu = [&](QAction* action, const auto& event_fn,
@@ -1766,13 +1755,8 @@ void GMainWindow::BootGame(const QString& filename) {
     MM3D::PlayerSettings::startup_hint_requested.store(false);
 #endif
 #ifdef ENABLE_MM3D_GAME_FOLDER
-    const auto expected=QFileInfo(MM3D::GameFolder::Rom()).canonicalFilePath();
-    if (expected.isEmpty() || QFileInfo(filename).canonicalFilePath()!=expected) {
-        QMessageBox::critical(this, tr("MM3D setup"), tr("Only the supported game in the Dekui folder can be opened in this build."));
-        return;
-    }
-    if (const auto error=MM3D::GameFolder::Validate(); !error.isEmpty()) {
-        QMessageBox::critical(this, tr("MM3D setup"), error);
+    if (const auto error = Dekui::ValidateBootPath(filename.toStdString())) {
+        QMessageBox::critical(this, tr("MM3D setup"), QString::fromStdString(*error));
         return;
     }
 #endif
@@ -1840,17 +1824,7 @@ void GMainWindow::BootGame(const QString& filename) {
     }
 
 #ifdef ENABLE_MM3D_GAME_FOLDER
-    Settings::values.resolution_factor.SetGlobal(true);
-    Settings::values.volume.SetGlobal(true);
-    Settings::values.use_vsync.SetGlobal(true);
-    Settings::values.use_disk_shader_cache.SetGlobal(true);
-    Settings::values.custom_textures.SetGlobal(true);
-    Settings::values.swap_screen.SetGlobal(true);
-    Settings::values.swap_screen=false;
-    Settings::values.layout_option.SetGlobal(true);
-    Settings::values.layout_option=Settings::LayoutOption::SingleScreen;
-    Settings::values.graphics_api.SetGlobal(true);
-    Settings::values.graphics_api=Settings::GraphicsAPI::Vulkan;
+    Dekui::ApplyBootSettings();
 #endif
     system.ApplySettings();
 
@@ -1900,6 +1874,20 @@ void GMainWindow::BootGame(const QString& filename) {
 
     connect(render_window, &GRenderWindow::Closed, this, &GMainWindow::OnStopGame);
     connect(render_window, &GRenderWindow::MouseActivity, this, &GMainWindow::OnMouseActivity);
+    connect(render_window, &GRenderWindow::SaveStateShortcut, this, [this](const QString& name) {
+        const std::array<std::pair<QString, QAction*>, 4> actions{{
+            {QStringLiteral("Quick Save"), ui->action_Quick_Save},
+            {QStringLiteral("Quick Load"), ui->action_Quick_Load},
+            {QStringLiteral("Save to Oldest Non-Quicksave Slot"), ui->action_Save_to_Oldest_Slot},
+            {QStringLiteral("Load from Newest Non-Quicksave Slot"), ui->action_Load_from_Newest_Slot},
+        }};
+        if (!emulation_running) return;
+        // The hidden save state menus are only refreshed when hovered.
+        UpdateSaveStates();
+        for (const auto& [action_name, action] : actions) {
+            if (action_name == name && action->isEnabled()) action->trigger();
+        }
+    });
     connect(secondary_window, &GRenderWindow::Closed, this, &GMainWindow::OnStopGame);
     connect(secondary_window, &GRenderWindow::MouseActivity, this, &GMainWindow::OnMouseActivity);
 
@@ -3288,9 +3276,19 @@ void GMainWindow::OnSaveState() {
     QAction* action = qobject_cast<QAction*>(sender());
     ASSERT(action);
 
-    system.SendSignal(Core::System::Signal::Save, action->data().toUInt());
+    const u32 slot = action->data().toUInt();
+    if (!system.SendSignal(Core::System::Signal::Save, slot)) {
+        return;
+    }
     system.frame_limiter.AdvanceFrame();
-    newest_slot = action->data().toUInt();
+    newest_slot = slot;
+#ifdef ENABLE_MM3D_PRESENTATION
+    // The Save States window shows a picture of each state.
+    u64 title_id{};
+    system.GetAppLoader().ReadProgramId(title_id);
+    DekuiCaptureStateThumbnail(
+        system, Core::SaveStateSlotPath(title_id, system.Movie().GetCurrentMovieID(), slot));
+#endif
 }
 
 void GMainWindow::OnLoadState() {
@@ -4849,6 +4847,13 @@ int LaunchQtFrontend(int argc, char* argv[]) {
     QtSwizzle::Dummy();
 #endif
 
+#ifdef ENABLE_MM3D_PRESENTATION
+    // Request JIT memory while the JIT enabler's debugger is still attached.
+    Dekui::InitializeJit();
+#elif defined(OAKNUT_APPLE_JIT26)
+    oaknut::apple_jit26::initialize();
+#endif
+
 #if MICROPROFILE_ENABLED
     MicroProfileOnThreadCreate("Frontend");
     SCOPE_EXIT({ MicroProfileShutdown(); });
@@ -4868,7 +4873,7 @@ int LaunchQtFrontend(int argc, char* argv[]) {
     auto rounding_policy = GetHighDpiRoundingPolicy();
     QApplication::setHighDpiScaleFactorRoundingPolicy(rounding_policy);
 
-#ifdef __APPLE__
+#ifdef Q_OS_MACOS
     auto bundle_dir = FileUtil::GetBundleDirectory();
     if (bundle_dir) {
         FileUtil::SetCurrentDir(bundle_dir.value() + "..");
@@ -4888,19 +4893,20 @@ int LaunchQtFrontend(int argc, char* argv[]) {
         return 0;
     }
 #ifdef ENABLE_MM3D_GAME_FOLDER
-    if (MM3D::GameFolder::Rom().isEmpty()) {
-        QMessageBox::information(nullptr, QStringLiteral("Game required"), MM3D::GameFolder::MissingGameMessage());
+    if (const auto error = Dekui::PrepareGameFolder()) {
+        const auto title = QString::fromStdString(error->title);
+        const auto message = QString::fromStdString(error->message);
+        if (error->kind == Dekui::SetupError::Kind::MissingGame)
+            QMessageBox::information(nullptr, title, message);
+        else
+            QMessageBox::critical(nullptr, title, message);
         return 1;
     }
-    if (const auto error=MM3D::GameFolder::Prepare(); !error.isEmpty()) {
-        QMessageBox::critical(nullptr, QStringLiteral("Dekui setup"), error);
-        return 1;
-    }
-    if (const auto error=MM3D::GameFolder::Validate(); !error.isEmpty()) {
-        QMessageBox::critical(nullptr, QStringLiteral("Dekui setup"), error);
-        return 1;
-    }
-    FileUtil::SetUserPath(MM3D::GameFolder::User().toStdString());
+#if defined(__APPLE__) && !defined(CITRA_VISIONOS)
+    // Before any game starts: share save states with the visionOS app through
+    // iCloud Drive when this Mac has its container.
+    Dekui::CloudStates::Enable();
+#endif
 #endif
 
     // Required when using .qrc resources from within a static library.

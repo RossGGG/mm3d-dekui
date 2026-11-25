@@ -26,6 +26,9 @@
 #include "core/core.h"
 #include "core/savestate.h"
 #include "video_core/rasterizer_interface.h"
+#ifdef ENABLE_MM3D_PRESENTATION
+#include "dekui_frontend/poller.h"
+#endif
 
 // Needs to be included at the end due to https://bugreports.qt.io/browse/QTBUG-73263
 #include <filesystem>
@@ -95,7 +98,12 @@ enum class MediaType : u32;
 
 int LaunchQtFrontend(int argc, char* argv[]);
 
-class GMainWindow : public QMainWindow {
+class GMainWindow : public QMainWindow
+#ifdef ENABLE_MM3D_PRESENTATION
+    ,
+                    private Dekui::Host
+#endif
+{
     Q_OBJECT
 
     /// Max number of recently loaded items to keep track of
@@ -326,6 +334,22 @@ private slots:
 #endif
 
 private:
+#ifdef ENABLE_MM3D_PRESENTATION
+    // Dekui::Host: UI the settings overlay asks for.
+    bool ModalOpen() const override;
+    void PersistConfig() override;
+    void OpenTextureFolder(const std::string& path) override;
+    void ShowLicenses(const std::string& path) override;
+    void ShowAbout() override;
+    void ShowControls() override;
+    void ShowSaveStates() override;
+    void SaveNewState() override;
+    void LoadLatestState() override;
+    void EditShortcut(Dekui::Shortcut shortcut) override;
+    void ToggleFullscreenRequested() override;
+    void Quit() override;
+    std::unique_ptr<Dekui::Poller> dekui_poller;
+#endif
     Q_INVOKABLE void OnMoviePlaybackCompleted();
     void UpdateStatusBar();
     void UpdateBootHomeMenuState();

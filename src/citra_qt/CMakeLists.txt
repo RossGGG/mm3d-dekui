@@ -28,6 +28,8 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     camera/qt_multimedia_camera.cpp
     camera/qt_multimedia_camera.h
     citra_qt.cpp
+    dekui_save_states.cpp
+    dekui_save_states.h
     citra_qt.h
     configuration/config.cpp
     configuration/config.h
@@ -212,6 +214,15 @@ if (APPLE)
     util/metal_util.h
     util/metal_util.mm
   )
+  if (ENABLE_MM3D_GAME_FOLDER AND NOT CITRA_VISIONOS)
+    # Save states shared with the visionOS app through its iCloud container.
+    target_sources(citra_qt PRIVATE
+      ../dekui_visionos/Bridge/icloud_states.h
+      ../dekui_visionos/Bridge/icloud_states.mm
+      dekui_app_menu.h
+      dekui_app_menu.mm
+    )
+  endif()
 endif()
 
 file(GLOB COMPAT_LIST
