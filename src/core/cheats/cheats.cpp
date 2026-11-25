@@ -13,6 +13,9 @@
 #ifdef ENABLE_MM3D_PRESENTATION
 #include "core/memory.h"
 #include "core/hle/kernel/process.h"
+#include "mm3d/cheat_test.h"
+#include "mm3d/hitch_place.h"
+#include "mm3d/shader_tour.h"
 #include "mm3d/simple_cheats.h"
 #endif
 
@@ -111,15 +114,32 @@ void CheatEngine::LoadCheatFile(u64 title_id) {
     }
 }
 
+#ifdef ENABLE_MM3D_PRESENTATION
+namespace {
+struct Guest {
+    Memory::MemorySystem& memory; const Kernel::Process& process;
+    std::optional<u32> Read(u32 at){return memory.Read32OrNullopt(process,at);}
+    void Write(u32 at,u32 value){memory.Write32(process,at,value);}
+};
+} // namespace
+
+void CheatEngine::ApplyMoonJump() {
+    if(auto process=system.Kernel().GetProcessById(process_id)) {
+        Guest guest{system.Memory(),*process};
+        MM3D::SimpleCheats::ApplyMoonJump(guest);
+    }
+}
+#endif
+
 void CheatEngine::RunCallback([[maybe_unused]] std::uintptr_t user_data, s64 cycles_late) {
 #ifdef ENABLE_MM3D_PRESENTATION
     if(auto process=system.Kernel().GetProcessById(process_id)) {
-        struct Guest {
-            Memory::MemorySystem& memory; const Kernel::Process& process;
-            std::optional<u32> Read(u32 at){return memory.Read32OrNullopt(process,at);}
-            void Write(u32 at,u32 value){memory.Write32(process,at,value);}
-        } guest{system.Memory(),*process};
-        MM3D::SimpleCheats::Tick(guest,process->codeset&&process->codeset->program_id==0x0004000000125500ULL);
+        Guest guest{system.Memory(),*process};
+        const bool mm3d=process->codeset&&process->codeset->program_id==0x0004000000125500ULL;
+        MM3D::SimpleCheats::Tick(guest,mm3d);
+        MM3D::ShaderTour::Tick(guest,mm3d);
+        MM3D::CheatTest::Tick(guest,mm3d);
+        MM3D::HitchPlace::Tick(guest,mm3d);
     } else MM3D::SimpleCheats::Reset();
 #endif
     {

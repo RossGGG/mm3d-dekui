@@ -54,6 +54,9 @@ public:
         return process_id;
     }
 
+    /// MM3D moon jump, from the HID pad update while L + A are held.
+    void ApplyMoonJump();
+
 private:
     /// The cheat execution callback.
     void RunCallback(std::uintptr_t user_data, s64 cycles_late);
