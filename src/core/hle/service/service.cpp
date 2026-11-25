@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 #include "common/assert.h"
 #include "common/hacks/hack_manager.h"
+#include "common/hitch_trace.h"
 #include "common/logging/log.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
@@ -185,6 +186,7 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
 
     LOG_TRACE(Service, "{}",
               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+    const Common::HitchTrace::CallScope hitch_call{service_name.c_str(), info->name};
     handler_invoker(this, info->handler_callback, context);
 }
 

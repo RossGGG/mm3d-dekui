@@ -4,6 +4,7 @@
 
 #include <boost/serialization/unique_ptr.hpp>
 #include "common/archives.h"
+#include "common/hitch_trace.h"
 #include "common/logging/log.h"
 #include "core/core.h"
 #include "core/file_sys/errors.h"
@@ -54,6 +55,7 @@ File::File(Kernel::KernelSystem& kernel)
 }
 
 void File::Read(Kernel::HLERequestContext& ctx) {
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::FileRead};
     IPC::RequestParser rp(ctx);
     u64 offset = rp.Pop<u64>();
     u32 length = rp.Pop<u32>();

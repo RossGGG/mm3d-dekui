@@ -12,6 +12,7 @@
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 #include "common/file_util.h"
+#include "common/hitch_trace.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/perf_stats.h"
@@ -87,7 +88,10 @@ void PerfStats::StartSwap() {
 }
 
 void PerfStats::EndSwap() {
-    accumulated_swap_time += (Clock::now() - start_swap_time);
+    const auto swap_time = Clock::now() - start_swap_time;
+    accumulated_swap_time += swap_time;
+    Common::HitchTrace::Add(Common::HitchTrace::Phase::Present,
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(swap_time));
 }
 
 void PerfStats::BeginSystemFrame() {
@@ -101,6 +105,7 @@ void PerfStats::EndSystemFrame() {
 
     auto frame_end = Clock::now();
     const auto frame_time = frame_end - frame_begin;
+    Common::HitchTrace::EndFrame(std::chrono::duration_cast<std::chrono::nanoseconds>(frame_time));
     if (current_index < perf_history.size()) {
         perf_history[current_index++] =
             std::chrono::duration<double, std::milli>(frame_time).count();
