@@ -1,0 +1,397 @@
+diff --git a/include/oaknut/code_block.hpp b/include/oaknut/code_block.hpp
+index bfa87d9..92a0ee4 100644
+--- a/include/oaknut/code_block.hpp
++++ b/include/oaknut/code_block.hpp
+@@ -17,6 +17,7 @@
+ #    include <pthread.h>
+ #    include <sys/mman.h>
+ #    include <unistd.h>
++#    include "oaknut/apple_jit26.hpp"
+ #else
+ #    include <sys/mman.h>
+ #endif
+@@ -31,7 +32,15 @@ public:
+ #if defined(_WIN32)
+         m_memory = (std::uint32_t*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+ #elif defined(__APPLE__)
+-#    if TARGET_OS_IPHONE
++#    if defined(OAKNUT_APPLE_JIT26)
++        // TXM devices only execute debugger-prepared memory; write through an alias.
++        const auto [xmem, wmem] = apple_jit26::allocate(size);
++        m_memory = static_cast<std::uint32_t*>(xmem);
++        m_wmemory = static_cast<std::uint32_t*>(wmem);
++        m_jit26 = m_memory != nullptr;
++        if (!m_jit26)
++            m_memory = (std::uint32_t*)MAP_FAILED;
++#    elif TARGET_OS_IPHONE && !TARGET_OS_VISION
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+ #    else
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
+@@ -44,8 +53,14 @@ public:
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+ #endif
+ 
+-        if (m_memory == nullptr)
++        // mmap reports failure with MAP_FAILED, not nullptr. Checking both keeps a
++        // denied JIT allocation from becoming a misleading write through address -1.
++        if (m_memory == nullptr || m_memory == MAP_FAILED) {
++            m_memory = nullptr;
+             throw std::bad_alloc{};
++        }
++        if (m_wmemory == nullptr)
++            m_wmemory = m_memory;
+     }
+ 
+     ~CodeBlock()
+@@ -53,6 +68,12 @@ public:
+         if (m_memory == nullptr)
+             return;
+ 
++#if defined(OAKNUT_APPLE_JIT26)
++        if (m_jit26) {
++            apple_jit26::deallocate(m_memory, m_size);
++            return;
++        }
++#endif
+ #if defined(_WIN32)
+         VirtualFree((void*)m_memory, 0, MEM_RELEASE);
+ #else
+@@ -65,13 +86,25 @@ public:
+     CodeBlock(CodeBlock&&) = delete;
+     CodeBlock& operator=(CodeBlock&&) = delete;
+ 
++    /// Executable address of the block.
+     std::uint32_t* ptr() const
+     {
+         return m_memory;
+     }
+ 
++    /// Address to write code through. Equal to ptr() unless the platform
++    /// requires a separate writable alias (TXM-enforced Apple devices).
++    std::uint32_t* wptr() const
++    {
++        return m_wmemory;
++    }
++
+     void protect()
+     {
++#if defined(OAKNUT_APPLE_JIT26)
++        if (m_jit26)
++            return;
++#endif
+ #if defined(__APPLE__) && !TARGET_OS_IPHONE
+         pthread_jit_write_protect_np(1);
+ #elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+@@ -81,6 +114,10 @@ public:
+ 
+     void unprotect()
+     {
++#if defined(OAKNUT_APPLE_JIT26)
++        if (m_jit26)
++            return;
++#endif
+ #if defined(__APPLE__) && !TARGET_OS_IPHONE
+         pthread_jit_write_protect_np(0);
+ #elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+@@ -91,7 +128,8 @@ public:
+     void invalidate(std::uint32_t* mem, std::size_t size)
+     {
+ #if defined(__APPLE__)
+-        sys_icache_invalidate(mem, size);
++        // Clean through the writable alias; Apple's caches are physically tagged.
++        sys_icache_invalidate(m_wmemory + (mem - m_memory), size);
+ #elif defined(_WIN32)
+         FlushInstructionCache(GetCurrentProcess(), mem, size);
+ #else
+@@ -137,7 +175,9 @@ public:
+ 
+ protected:
+     std::uint32_t* m_memory;
++    std::uint32_t* m_wmemory = nullptr;
+     std::size_t m_size = 0;
++    bool m_jit26 = false;
+ };
+ 
+ }  // namespace oaknut
+diff --git a/include/oaknut/apple_jit26.hpp b/include/oaknut/apple_jit26.hpp
+new file mode 100644
+index 0000000..447ad82
+--- /dev/null
++++ b/include/oaknut/apple_jit26.hpp
+@@ -0,0 +1,276 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 Dekui contributors
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++// Debugger-assisted JIT memory for TXM-enforced Apple devices (Vision Pro).
++//
++// On these devices a process can never make its own writable memory
++// executable: MAP_JIT is rejected and mprotect() silently drops PROT_EXEC.
++// Only a mapping that an attached debugger allocated and wrote to can run
++// code. The StikDebug "JIT26" breakpoint protocol asks the debugger to do
++// that once for a single arena, which is then remapped locally as a writable
++// alias of the same physical pages. All oaknut::CodeBlock instances are
++// sub-allocated from that arena.
++//
++// Protocol: `brk #0xf00d` with the command in x16.
++//   x16 = 1 (prepare region): x0 = address (NULL lets the debugger allocate),
++//                             x1 = length; returns the RX address in x0.
++//   x16 = 0 (detach).
++// Executing the breakpoint with no debugger attached kills the process, so
++// every request is gated on CS_DEBUGGED.
++
++#if defined(__APPLE__) && defined(__aarch64__)
++#    include <TargetConditionals.h>
++#    if TARGET_OS_VISION && !TARGET_OS_SIMULATOR
++#        define OAKNUT_APPLE_JIT26 1
++#    endif
++#endif
++
++#if defined(OAKNUT_APPLE_JIT26)
++
++#    include <cstddef>
++#    include <cstdint>
++#    include <cstdio>
++#    include <cstdlib>
++#    include <iterator>
++#    include <map>
++#    include <mutex>
++#    include <utility>
++
++#    include <mach/mach.h>
++#    include <mach/vm_map.h>
++#    include <sys/types.h>
++#    include <unistd.h>
++
++extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
++
++namespace oaknut::apple_jit26 {
++
++inline bool is_debugger_attached();
++
++namespace detail {
++
++constexpr std::size_t page_size = 16 * 1024;
++constexpr std::size_t alignment = 64;
++constexpr unsigned int cs_ops_status = 0;
++constexpr std::uint32_t cs_debugged = 0x10000000;
++
++__attribute__((naked, noinline)) static void* prepare_region(void*, std::size_t)
++{
++    __asm__ volatile(
++        "mov x16, #1\n"
++        "brk #0xf00d\n"
++        "ret\n");
++}
++
++__attribute__((naked, noinline)) static void detach()
++{
++    __asm__ volatile(
++        "mov x16, #0\n"
++        "brk #0xf00d\n"
++        "ret\n");
++}
++
++struct Arena {
++    std::once_flag once;
++    std::mutex mutex;
++    std::uint8_t* rx = nullptr;
++    std::uint8_t* rw = nullptr;
++    std::size_t size = 0;
++    // Free ranges, keyed by offset, valued by length.
++    std::map<std::size_t, std::size_t> free_list;
++};
++
++inline Arena& arena()
++{
++    static Arena instance;
++    return instance;
++}
++
++inline std::size_t round_up(std::size_t value, std::size_t align)
++{
++    return (value + align - 1) & ~(align - 1);
++}
++
++// Debugger writes re-protect memory page by page, which can split the
++// region into many VM map entries, so walk every entry in the range.
++inline bool region_is_executable(void* address, std::size_t size)
++{
++    const auto begin = reinterpret_cast<vm_address_t>(address);
++    const vm_address_t end = begin + size;
++    vm_address_t cursor = begin;
++    while (cursor < end) {
++        vm_address_t region = cursor;
++        vm_size_t region_size = 0;
++        vm_region_basic_info_data_64_t info{};
++        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++        mach_port_t object = MACH_PORT_NULL;
++        const kern_return_t kr = vm_region_64(mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64,
++                                              reinterpret_cast<vm_region_info_t>(&info), &count, &object);
++        if (kr != KERN_SUCCESS || region > cursor || (info.protection & VM_PROT_EXECUTE) == 0) {
++            std::fprintf(stderr, "[JIT26] page 0x%lx is not executable (kr=%d region=0x%lx prot=%d max=%d)\n",
++                         static_cast<unsigned long>(cursor), kr, static_cast<unsigned long>(region),
++                         info.protection, info.max_protection);
++            return false;
++        }
++        cursor = region + region_size;
++    }
++    return true;
++}
++
++inline void log(const char* message, const void* address = nullptr, std::size_t size = 0)
++{
++    std::fprintf(stderr, "[JIT26] %s (address=%p size=%zu)\n", message, address, size);
++}
++
++inline void initialize_locked(Arena& a, std::size_t requested_size)
++{
++    if (!is_debugger_attached()) {
++        log("no debugger attached; JIT unavailable");
++        return;
++    }
++
++    const std::size_t size = round_up(requested_size, page_size);
++    void* rx = nullptr;
++    // An unserviced breakpoint leaves garbage (often the brk encoding) in x0.
++    // Retry only that case: a real region takes the debugger minutes to
++    // prepare over Wi-Fi, so never request it twice.
++    for (int attempt = 0; attempt < 3; ++attempt) {
++        void* result = prepare_region(nullptr, size);
++        const auto value = reinterpret_cast<std::uintptr_t>(result);
++        if (!result || value % page_size != 0 || value < 0x100000000ull) {
++            log("debugger did not service the region request", result, size);
++            usleep(100 * 1000);
++            continue;
++        }
++        if (!region_is_executable(result, size)) {
++            log("debugger returned a region that is not executable; JIT unavailable", result, size);
++            return;
++        }
++        rx = result;
++        break;
++    }
++    if (!rx)
++        return;
++
++    vm_address_t rw = 0;
++    vm_prot_t cur_prot = VM_PROT_NONE;
++    vm_prot_t max_prot = VM_PROT_NONE;
++    kern_return_t kr = vm_remap(mach_task_self(), &rw, size, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
++                                reinterpret_cast<vm_address_t>(rx), false, &cur_prot, &max_prot, VM_INHERIT_NONE);
++    if (kr != KERN_SUCCESS) {
++        log("vm_remap of the executable region failed", rx, size);
++        return;
++    }
++    kr = vm_protect(mach_task_self(), rw, size, false, VM_PROT_READ | VM_PROT_WRITE);
++    if (kr != KERN_SUCCESS) {
++        log("could not make the writable alias writable", reinterpret_cast<void*>(rw), size);
++        vm_deallocate(mach_task_self(), rw, size);
++        return;
++    }
++
++    // Every region the JIT will ever use now exists; release the debugger.
++    if (std::getenv("DEKUI_JIT26_NO_DETACH") == nullptr)
++        detach();
++
++    a.rx = static_cast<std::uint8_t*>(rx);
++    a.rw = reinterpret_cast<std::uint8_t*>(rw);
++    a.size = size;
++    a.free_list.emplace(0, size);
++    log("executable arena ready", rx, size);
++}
++
++}  // namespace detail
++
++/// True when a debugger (e.g. StikDebug, Apparition, or Xcode with the JIT26
++/// LLDB script) has attached to this process.
++inline bool is_debugger_attached()
++{
++    std::uint32_t flags = 0;
++    return csops(getpid(), detail::cs_ops_status, &flags, sizeof(flags)) == 0 && (flags & detail::cs_debugged) != 0;
++}
++
++/// Arena size: DEKUI_JIT26_ARENA_MB from the environment, else 128 MiB. Every
++/// 16 KiB page is touched by the debugger, which is slow over Wi-Fi LLDB.
++inline std::size_t default_arena_size()
++{
++    if (const char* env = std::getenv("DEKUI_JIT26_ARENA_MB")) {
++        const long mib = std::strtol(env, nullptr, 10);
++        if (mib > 0)
++            return static_cast<std::size_t>(mib) * 1024 * 1024;
++    }
++    return 128 * 1024 * 1024;
++}
++
++/// Requests the executable arena from the debugger. Safe to call repeatedly;
++/// only the first call has any effect. Call it as early as possible, while the
++/// JIT enabler's script is still attached.
++inline void initialize(std::size_t size = default_arena_size())
++{
++    auto& a = detail::arena();
++    std::call_once(a.once, [&] {
++        std::lock_guard lock{a.mutex};
++        detail::initialize_locked(a, size);
++    });
++}
++
++/// True once the executable arena has been prepared.
++inline bool is_ready()
++{
++    auto& a = detail::arena();
++    std::lock_guard lock{a.mutex};
++    return a.rx != nullptr;
++}
++
++/// Allocates `size` bytes from the arena. Returns {executable, writable}
++/// pointers to the same memory, or {nullptr, nullptr} when exhausted.
++inline std::pair<void*, void*> allocate(std::size_t size)
++{
++    auto& a = detail::arena();
++    std::lock_guard lock{a.mutex};
++    if (!a.rx)
++        return {nullptr, nullptr};
++
++    size = detail::round_up(size, detail::alignment);
++    for (auto it = a.free_list.begin(); it != a.free_list.end(); ++it) {
++        const auto [offset, length] = *it;
++        if (length < size)
++            continue;
++        a.free_list.erase(it);
++        if (length > size)
++            a.free_list.emplace(offset + size, length - size);
++        if (size >= 1024 * 1024)
++            detail::log("allocated JIT code cache", a.rx + offset, size);
++        return {a.rx + offset, a.rw + offset};
++    }
++    detail::log("executable arena exhausted", nullptr, size);
++    return {nullptr, nullptr};
++}
++
++/// Returns an allocation made by allocate().
++inline void deallocate(void* executable, std::size_t size)
++{
++    auto& a = detail::arena();
++    std::lock_guard lock{a.mutex};
++    std::size_t offset = static_cast<std::uint8_t*>(executable) - a.rx;
++    size = detail::round_up(size, detail::alignment);
++
++    auto next = a.free_list.lower_bound(offset);
++    if (next != a.free_list.end() && offset + size == next->first) {
++        size += next->second;
++        next = a.free_list.erase(next);
++    }
++    if (next != a.free_list.begin()) {
++        auto prev = std::prev(next);
++        if (prev->first + prev->second == offset) {
++            prev->second += size;
++            return;
++        }
++    }
++    a.free_list.emplace(offset, size);
++}
++
++}  // namespace oaknut::apple_jit26
++
++#endif

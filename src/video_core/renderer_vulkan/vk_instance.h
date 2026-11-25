@@ -4,7 +4,9 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <span>
+#include <string_view>
 #include <mutex>
 
 #include "video_core/pica/regs_pipeline.h"
@@ -180,6 +182,11 @@ public:
         return external_memory_host;
     }
 
+    /// Returns true when VK_EXT_metal_objects is supported
+    bool HasMetalObjects() const {
+        return metal_objects;
+    }
+
     /// Returns true when VK_KHR_fragment_shader_barycentric is supported
     bool IsFragmentShaderBarycentricSupported() const {
         return fragment_shader_barycentric;
@@ -248,6 +255,18 @@ public:
     /// Returns true if shaders can declare the ClipDistance attribute
     bool IsShaderClipDistanceSupported() const {
         return features.shaderClipDistance;
+    }
+
+    /// Returns true if the PICA depth mapping is done per vertex: clip z with depth
+    /// clamp and a far clip plane, so fragment shaders need not write depth (which
+    /// disables early depth tests and hidden surface removal).
+    /// DEKUI_VERTEX_DEPTH=0 keeps the per-fragment depth write.
+    bool UseVertexDepth() const {
+        static const bool allowed = [] {
+            const char* value = std::getenv("DEKUI_VERTEX_DEPTH");
+            return !value || std::string_view{value} != "0";
+        }();
+        return allowed && features.depthClamp && features.shaderClipDistance;
     }
 
     /// Returns true if triangle fan is an accepted primitive topology
@@ -339,6 +358,7 @@ protected:
     bool fragment_shader_barycentric{};
     bool shader_stencil_export{};
     bool external_memory_host{};
+    bool metal_objects{};
     u64 min_imported_host_pointer_alignment{};
     bool layered_rendering_supported{true};
     bool tooling_info{};

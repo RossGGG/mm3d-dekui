@@ -84,7 +84,7 @@ if(MINGW)
   target_link_libraries(citra_libretro PRIVATE crypt32)
 endif()
 
-if(IOS)
+if(IOS OR CITRA_VISIONOS)
   target_compile_definitions(citra_libretro_common PRIVATE IOS)
   target_compile_definitions(citra_libretro PRIVATE IOS)
   target_link_libraries(citra_libretro PRIVATE "-framework CoreFoundation" "-framework Foundation")
@@ -92,7 +92,8 @@ endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR
     CMAKE_SYSTEM_NAME STREQUAL "iOS" OR
-    CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+    CMAKE_SYSTEM_NAME STREQUAL "tvOS" OR
+    CITRA_VISIONOS)
   target_link_libraries(citra_libretro PRIVATE "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/libretro.osx.def")
 else()
   target_link_libraries(citra_libretro PRIVATE "-Wl,-Bsymbolic")

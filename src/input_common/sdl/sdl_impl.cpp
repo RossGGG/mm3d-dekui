@@ -15,6 +15,9 @@
 #include <utility>
 #include <vector>
 #include <SDL.h>
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+#include <SDL_main.h>
+#endif
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/math_util.h"
@@ -384,6 +387,12 @@ void SDLState::InitJoystick(int joystick_index) {
         params.Set("guid",guid);params.Set("port",port);
         // Existing Auto Map expects the native A position (right face button).
         params.Set("button",int(SDL_CONTROLLER_BUTTON_B));
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+        // Dekui's motion source picks a controller with a gyroscope. Some
+        // (DualSense through GameController.framework) have no accelerometer.
+        params.Set("gyro",SDL_GameControllerHasSensor(sdl_gamecontroller,SDL_SENSOR_GYRO)?1:0);
+        params.Set("accel",SDL_GameControllerHasSensor(sdl_gamecontroller,SDL_SENSOR_ACCEL)?1:0);
+#endif
         connected_controllers[SDL_JoystickInstanceID(sdl_joystick)]=std::move(params);
     };
     if (joystick_map.find(guid) == joystick_map.end()) {
@@ -813,6 +822,16 @@ SDLState::SDLState() {
     RegisterFactory<TouchDevice>("sdl", std::make_shared<SDLTouchFactory>(*this));
     // If the frontend is going to manage the event loop, then we dont start one here
     start_thread = !SDL_WasInit(SDL_INIT_GAMECONTROLLER);
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+    // The visionOS frontend is launched by Qt/UIKit rather than SDL_main. SDL's
+    // Apple bootstrap otherwise rejects SDL_Init before controllers are opened.
+    SDL_SetMainReady();
+#endif
+#ifdef CITRA_TVOS
+    // The Siri Remote opens Dekui's menu and navigates it; it is not a game
+    // controller.
+    SDL_SetHint(SDL_HINT_TV_REMOTE_AS_JOYSTICK, "0");
+#endif
     if (start_thread && SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
         LOG_CRITICAL(Input, "SDL_Init(SDL_INIT_GAMECONTROLLER) failed with: {}", SDL_GetError());
         return;
@@ -1182,6 +1201,7 @@ public:
         analog_xaxis = -1;
         analog_yaxis = -1;
         analog_axes_joystick = -1;
+        analog_event_type = 0;
     }
 
     Common::ParamPackage GetNextInput() override {
@@ -1191,6 +1211,13 @@ public:
             if ((event.type != SDL_JOYAXISMOTION && event.type != SDL_CONTROLLERAXISMOTION)) {
                 continue;
             }
+            // SDL reports a game controller's sticks both as joystick and as
+            // controller axes, numbered differently. Take both axes from the
+            // same kind of event, or the binding mixes the two numberings.
+            if (analog_event_type != 0 && event.type != analog_event_type)
+                continue;
+            if (event.type == SDL_JOYAXISMOTION && SDL_GameControllerFromInstanceID(event.jaxis.which))
+                continue;
             which = event.type == SDL_JOYAXISMOTION ? event.jaxis.which : event.caxis.which;
             auto value = event.type == SDL_JOYAXISMOTION ? event.jaxis.value : event.caxis.value;
 
@@ -1199,6 +1226,11 @@ public:
             // An analog device needs two axes, so we need to store the axis for later and wait
             // for a second SDL event. The axes also must be from the same joystick.
             int axis = event.type == SDL_JOYAXISMOTION ? event.jaxis.axis : event.caxis.axis;
+            // Triggers are not stick axes.
+            if (event.type == SDL_CONTROLLERAXISMOTION &&
+                (axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT))
+                continue;
+            analog_event_type = event.type;
 
             if (analog_xaxis == -1) {
                 analog_xaxis = axis;
@@ -1216,7 +1248,7 @@ public:
             params.Set("guid", joystick->GetGUID());
             params.Set("axis_x", analog_xaxis);
             params.Set("axis_y", analog_yaxis);
-            if (event.type == SDL_JOYAXISMOTION) {
+            if (analog_event_type == SDL_JOYAXISMOTION) {
                 params.Set("api", "joystick");
             } else {
                 params.Set("api", "controller");
@@ -1226,6 +1258,7 @@ public:
             analog_xaxis = -1;
             analog_yaxis = -1;
             analog_axes_joystick = -1;
+            analog_event_type = 0;
             return params;
         }
         return params;
@@ -1235,6 +1268,7 @@ private:
     int analog_xaxis = -1;
     int analog_yaxis = -1;
     SDL_JoystickID analog_axes_joystick = -1;
+    Uint32 analog_event_type = 0;
 };
 } // namespace Polling
 

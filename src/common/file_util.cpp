@@ -1055,13 +1055,48 @@ bool StringReplace(std::string& haystack, const std::string& a, const std::strin
     return true;
 }
 
+namespace {
+
+/// Save states made by older builds stored some host paths verbatim, so a state
+/// saved on one device (or before its user folder moved) can name another
+/// machine's user folder. Move such a path onto this user folder, which has
+/// the same layout. Only paths into one of Citra's own user subfolders move.
+std::string RebaseUserPath(std::string path) {
+    const std::string& user = GetUserPath(UserPath::UserDir);
+    const bool absolute = !path.empty() && (path[0] == '/' || path[0] == '\\' ||
+                                            (path.size() > 2 && path[1] == ':'));
+    if (!absolute || path.starts_with(user)) {
+        return path;
+    }
+    static constexpr std::array<std::string_view, 8> subfolders{
+        "load/", "sdmc/", "nand/", "sysdata/", "states/", "config/", "cache/", "dump/"};
+    for (std::size_t at = path.find("user"); at != std::string::npos; at = path.find("user", at + 1)) {
+        const bool starts_component = at > 0 && (path[at - 1] == '/' || path[at - 1] == '\\');
+        if (!starts_component || at + 5 > path.size() ||
+            (path[at + 4] != '/' && path[at + 4] != '\\')) {
+            continue;
+        }
+        std::string rest = path.substr(at + 5);
+        std::replace(rest.begin(), rest.end(), '\\', '/');
+        for (const auto subfolder : subfolders) {
+            if (rest.starts_with(subfolder)) {
+                LOG_INFO(Common_Filesystem, "Save state path {} moved to this user folder", path);
+                return user + rest;
+            }
+        }
+    }
+    return path;
+}
+
+} // namespace
+
 std::string SerializePath(const std::string& input, bool is_saving) {
     auto result = input;
     StringReplace(result, "%CITRA_ROM_FILE%", g_currentRomPath, is_saving);
     StringReplace(result, "%CITRA_USER_DIR%", GetUserPath(UserPath::UserDir), is_saving);
     StringReplace(result, "%CITRA_USER_SDMC%", GetUserPath(UserPath::SDMCDir), is_saving);
     StringReplace(result, "%CITRA_USER_NAND%", GetUserPath(UserPath::NANDDir), is_saving);
-    return result;
+    return is_saving ? result : RebaseUserPath(std::move(result));
 }
 
 const std::string& GetUserPath(UserPath path) {

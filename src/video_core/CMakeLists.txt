@@ -187,6 +187,8 @@ if (ENABLE_VULKAN)
         renderer_vulkan/vk_platform.h
         $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_present_window.cpp>
         $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_present_window.h>
+        $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_external_present.cpp>
+        $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_external_present.h>
         renderer_vulkan/vk_render_manager.cpp
         renderer_vulkan/vk_render_manager.h
         renderer_vulkan/vk_shader_disk_cache.cpp
@@ -194,6 +196,8 @@ if (ENABLE_VULKAN)
         renderer_vulkan/vk_shader_util.cpp
         renderer_vulkan/vk_shader_util.h
         renderer_vulkan/vk_stream_buffer.cpp
+        renderer_vulkan/vk_simulator_workarounds.cpp
+        renderer_vulkan/vk_simulator_workarounds.h
         renderer_vulkan/vk_stream_buffer.h
         $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_swapchain.cpp>
         $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_swapchain.h>

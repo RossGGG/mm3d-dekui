@@ -11,13 +11,48 @@ function(target_disable_warnings target)
     if (MSVC)
         target_compile_options(${target} INTERFACE /W0)
     else()
-        target_compile_options(${target} INTERFACE -w)
+        # Swift sources in consumers (the visionOS app) do not accept -w.
+        target_compile_options(${target} INTERFACE $<$<NOT:$<COMPILE_LANGUAGE:Swift>>:-w>)
     endif()
 endfunction()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${PROJECT_SOURCE_DIR}/CMakeModules)
 include(DownloadExternals)
 include(ExternalProject)
+
+# visionOS needs small changes inside some submodules (debugger-assisted JIT
+# memory, CoreAudio session handling). They live as patches in tools/visionos
+# so a fresh clone reproduces them; apply each once, skipping it when the
+# submodule already contains it.
+function(apply_visionos_patch submodule patch)
+    set(source_dir "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}")
+    set(patch_file "${PROJECT_SOURCE_DIR}/tools/visionos/${patch}")
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${source_dir}" apply --reverse --check "${patch_file}"
+                    RESULT_VARIABLE already_applied OUTPUT_QUIET ERROR_QUIET)
+    if (already_applied EQUAL 0)
+        return()
+    endif()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${source_dir}" apply "${patch_file}"
+                    RESULT_VARIABLE result ERROR_VARIABLE error)
+    if (NOT result EQUAL 0)
+        message(FATAL_ERROR "Could not apply ${patch} to externals/${submodule}: ${error}")
+    endif()
+    message(STATUS "Applied ${patch} to externals/${submodule}")
+endfunction()
+
+if (CITRA_VISIONOS)
+    find_package(Git REQUIRED)
+    if (NOT USE_SYSTEM_OAKNUT)
+        apply_visionos_patch(oaknut oaknut-visionos-jit26.patch)
+    endif()
+    if (NOT USE_SYSTEM_DYNARMIC)
+        # Uses CodeBlock::wptr() from the oaknut patch.
+        apply_visionos_patch(dynarmic dynarmic-visionos-jit26.patch)
+    endif()
+    if (ENABLE_SDL2 AND NOT USE_SYSTEM_SDL2)
+        apply_visionos_patch(sdl2/SDL sdl2-visionos-coreaudio.patch)
+    endif()
+endif()
 
 # Boost
 if (USE_SYSTEM_BOOST)
@@ -324,6 +359,12 @@ else()
     # LibreSSL
     set(LIBRESSL_SKIP_INSTALL ON CACHE BOOL "")
     set(OPENSSLDIR "/etc/ssl/")
+    # The visionOS SDK ships an endian.h compatibility header, but it does not
+    # provide the GNU htobe* macros that LibreSSL's feature check assumes.
+    # Force LibreSSL to use its Apple OSByteOrder compatibility implementation.
+    if (CITRA_VISIONOS OR CITRA_TVOS)
+        set(HAVE_ENDIAN_H OFF CACHE INTERNAL "" FORCE)
+    endif()
     add_subdirectory(libressl EXCLUDE_FROM_ALL)
     target_include_directories(ssl INTERFACE ./libressl/include)
     target_disable_warnings(ssl)
@@ -404,6 +445,12 @@ if (ENABLE_OPENAL)
     else()
         if (BSD STREQUAL "OpenBSD")
             set(ALSOFT_BACKEND_SOLARIS OFF CACHE BOOL "")
+        endif()
+        if (CITRA_VISIONOS OR CITRA_TVOS)
+            # OpenAL Soft's CoreAudio backend includes macOS-only IOKit audio
+            # headers. Keep the Null/Wave backends for the initial visionOS
+            # port until a visionOS-native audio backend is wired up.
+            set(ALSOFT_BACKEND_COREAUDIO OFF CACHE BOOL "" FORCE)
         endif()
         set(ALSOFT_EMBED_HRTF_DATA OFF CACHE BOOL "")
         set(ALSOFT_EXAMPLES OFF CACHE BOOL "")

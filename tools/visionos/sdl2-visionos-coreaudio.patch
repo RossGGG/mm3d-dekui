@@ -1,0 +1,13 @@
+diff --git a/src/audio/coreaudio/SDL_coreaudio.h b/src/audio/coreaudio/SDL_coreaudio.h
+index 2a9fac2cc..3efbb2e35 100644
+--- a/src/audio/coreaudio/SDL_coreaudio.h
++++ b/src/audio/coreaudio/SDL_coreaudio.h
+@@ -25,7 +25,7 @@
+ 
+ #include "../SDL_sysaudio.h"
+ 
+-#if !defined(__IPHONEOS__)
++#if !defined(__IPHONEOS__) && !TARGET_OS_VISION
+ #define MACOSX_COREAUDIO
+ #endif
+ 

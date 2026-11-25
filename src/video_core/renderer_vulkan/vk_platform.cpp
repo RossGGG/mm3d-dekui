@@ -25,6 +25,14 @@
 #include "core/frontend/emu_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+// MoltenVK is linked as a static archive on visionOS, so there is no dylib for
+// Common::DynamicLibrary to open. This reference also prevents the linker from
+// dead-stripping MoltenVK's Vulkan entry point.
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance,
+                                                                          const char* name);
+#endif
+
 namespace Vulkan {
 
 namespace {
@@ -288,16 +296,21 @@ vk::InstanceCreateFlags GetInstanceFlags() {
 vk::UniqueInstance CreateInstance(const Common::DynamicLibrary& library,
                                   Frontend::WindowSystemType window_type, bool enable_validation,
                                   bool dump_command_buffers) {
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+    (void)library;
+    const PFN_vkGetInstanceProcAddr get_instance_proc_addr = &::vkGetInstanceProcAddr;
+#else
     if (!library.IsLoaded()) {
         throw std::runtime_error("Failed to load Vulkan driver library");
     }
 
-    const auto vkGetInstanceProcAddr =
+    const auto get_instance_proc_addr =
         library.GetSymbol<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
-    if (!vkGetInstanceProcAddr) {
+#endif
+    if (!get_instance_proc_addr) {
         throw std::runtime_error("Failed GetSymbol vkGetInstanceProcAddr");
     }
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
     const u32 available_version = VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
                                       ? vk::enumerateInstanceVersion()

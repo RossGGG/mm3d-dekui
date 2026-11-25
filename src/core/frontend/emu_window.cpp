@@ -210,7 +210,14 @@ void EmuWindow::TouchMoved(unsigned framebuffer_x, unsigned framebuffer_y) {
 
 void EmuWindow::UpdateCurrentFramebufferLayout(u32 width, u32 height, bool is_portrait_mode) {
     Layout::FramebufferLayout layout;
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+    // The visionOS window is the TV-style presentation surface. Compose only
+    // the primary 3DS screen into it and let SingleFrameLayout preserve the
+    // source aspect ratio while scaling it to the largest centered rectangle.
+    const Settings::LayoutOption layout_option = Settings::LayoutOption::SingleScreen;
+#else
     const Settings::LayoutOption layout_option = Settings::values.layout_option.GetValue();
+#endif
     const Settings::StereoRenderOption stereo_option = get3DMode();
     bool render_full_stereo = (stereo_option == Settings::StereoRenderOption::SideBySideFull);
     bool is_bottom = is_secondary;

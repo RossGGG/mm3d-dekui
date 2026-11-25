@@ -5,7 +5,9 @@
 #include "common/arch.h"
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
 
+#include <new>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/hash.h"
 #include "common/microprofile.h"
 #include "video_core/shader/shader.h"
@@ -36,7 +38,14 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
         setup.cached_shader = iter->second.get();
     } else {
         auto shader = std::make_unique<JitShader>();
-        shader->Compile(&setup.GetProgramCode(), &setup.GetSwizzleData());
+        try {
+            shader->Compile(&setup.GetProgramCode(), &setup.GetSwizzleData());
+        } catch (const std::bad_alloc&) {
+            // Executable memory can be a fixed budget (visionOS JIT arena).
+            LOG_WARNING(HW_GPU, "No executable memory for shader {:016x}; using the interpreter",
+                        cache_key);
+            shader = nullptr;
+        }
         setup.cached_shader = shader.get();
         cache.emplace_hint(iter, cache_key, std::move(shader));
     }
@@ -45,7 +54,10 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
 MICROPROFILE_DECLARE(GPU_Shader);
 
 void JitEngine::Run(const ShaderSetup& setup, ShaderUnit& state) const {
-    ASSERT(setup.cached_shader != nullptr);
+    if (setup.cached_shader == nullptr) {
+        fallback.Run(setup, state);
+        return;
+    }
 
     MICROPROFILE_SCOPE(GPU_Shader);
 

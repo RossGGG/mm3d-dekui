@@ -1,0 +1,441 @@
+diff --git a/.cmake.conf b/.cmake.conf
+index 34ee1423..dafb9877 100644
+--- a/.cmake.conf
++++ b/.cmake.conf
+@@ -65,4 +65,8 @@ set(QT_SUPPORTED_MAX_VISIONOS_SDK_VERSION "2")
+ set(QT_SUPPORTED_MIN_VISIONOS_XCODE_VERSION "15")
+ set(QT_SUPPORTED_MIN_VISIONOS_VERSION "1")
+ set(QT_SUPPORTED_MAX_VISIONOS_VERSION_TESTED "2")
++set(QT_SUPPORTED_MIN_TVOS_SDK_VERSION "17")
++set(QT_SUPPORTED_MAX_TVOS_SDK_VERSION "26")
++set(QT_SUPPORTED_MIN_TVOS_XCODE_VERSION "15")
++set(QT_SUPPORTED_MIN_TVOS_VERSION "17")
+ 
+diff --git a/cmake/QtAutoDetectHelpers.cmake b/cmake/QtAutoDetectHelpers.cmake
+index 3d7db25d..747f57c0 100644
+--- a/cmake/QtAutoDetectHelpers.cmake
++++ b/cmake/QtAutoDetectHelpers.cmake
+@@ -238,6 +238,8 @@ function(qt_auto_detect_apple)
+         set(CMAKE_SYSTEM_NAME "iOS" CACHE STRING "")
+     elseif("${QT_QMAKE_TARGET_MKSPEC}" STREQUAL "macx-visionos-clang")
+         set(CMAKE_SYSTEM_NAME "visionOS" CACHE STRING "")
++    elseif("${QT_QMAKE_TARGET_MKSPEC}" STREQUAL "macx-tvos-clang")
++        set(CMAKE_SYSTEM_NAME "tvOS" CACHE STRING "")
+     endif()
+ 
+     if(CMAKE_SYSTEM_NAME STREQUAL iOS)
+@@ -292,7 +294,7 @@ function(qt_auto_detect_apple)
+         set(CMAKE_OSX_SYSROOT "${sdk_name}" CACHE STRING "")
+     endif()
+ 
+-    if(CMAKE_SYSTEM_NAME STREQUAL iOS OR CMAKE_SYSTEM_NAME STREQUAL visionOS)
++    if(CMAKE_SYSTEM_NAME STREQUAL iOS OR CMAKE_SYSTEM_NAME STREQUAL visionOS OR CMAKE_SYSTEM_NAME STREQUAL tvOS)
+         if(NOT DEFINED BUILD_SHARED_LIBS)
+             qt_internal_ensure_static_qt_config()
+         endif()
+@@ -317,6 +319,8 @@ function(qt_auto_detect_apple)
+             set(version "${QT_SUPPORTED_MIN_IOS_VERSION}")
+         elseif(CMAKE_SYSTEM_NAME STREQUAL visionOS)
+             set(version "${QT_SUPPORTED_MIN_VISIONOS_VERSION}")
++        elseif(CMAKE_SYSTEM_NAME STREQUAL tvOS)
++            set(version "${QT_SUPPORTED_MIN_TVOS_VERSION}")
+         endif()
+         if(version)
+             set(CMAKE_OSX_DEPLOYMENT_TARGET "${version}" CACHE STRING "${description}")
+diff --git a/cmake/QtBaseGlobalTargets.cmake b/cmake/QtBaseGlobalTargets.cmake
+index 8d7df417..ee0c7155 100644
+--- a/cmake/QtBaseGlobalTargets.cmake
++++ b/cmake/QtBaseGlobalTargets.cmake
+@@ -378,6 +378,7 @@ qt_copy_or_install(DIRECTORY cmake/
+     PATTERN "macos" EXCLUDE
+     PATTERN "ios" EXCLUDE
+     PATTERN "visionos" EXCLUDE
++    PATTERN "tvos" EXCLUDE
+     PATTERN "platforms" EXCLUDE
+     PATTERN "QtBuildInternals" EXCLUDE
+ )
+@@ -393,6 +394,7 @@ if(QT_WILL_INSTALL)
+         PATTERN "macos" EXCLUDE
+         PATTERN "ios" EXCLUDE
+         PATTERN "visionos" EXCLUDE
++        PATTERN "tvos" EXCLUDE
+         PATTERN "platforms" EXCLUDE
+         PATTERN "QtBuildInternals" EXCLUDE
+     )
+@@ -405,6 +407,8 @@ if(APPLE)
+         set(platform_shortname "ios")
+     elseif(VISIONOS)
+         set(platform_shortname "visionos")
++    elseif(TVOS)
++        set(platform_shortname "tvos")
+     endif()
+ 
+     # Info.plist
+diff --git a/cmake/QtBuildPathsHelpers.cmake b/cmake/QtBuildPathsHelpers.cmake
+index bac0e352..da4604a9 100644
+--- a/cmake/QtBuildPathsHelpers.cmake
++++ b/cmake/QtBuildPathsHelpers.cmake
+@@ -237,6 +237,8 @@ macro(qt_internal_set_qt_apple_support_files_path)
+             set(__qt_internal_cmake_apple_support_files_path "${QT_CMAKE_DIR}/ios")
+         elseif(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+             set(__qt_internal_cmake_apple_support_files_path "${QT_CMAKE_DIR}/visionos")
++        elseif(CMAKE_SYSTEM_NAME STREQUAL "tvOS")
++            set(__qt_internal_cmake_apple_support_files_path "${QT_CMAKE_DIR}/tvos")
+         endif()
+     endif()
+ endmacro()
+diff --git a/cmake/QtConfig.cmake.in b/cmake/QtConfig.cmake.in
+index 93f47570..3d0accf2 100644
+--- a/cmake/QtConfig.cmake.in
++++ b/cmake/QtConfig.cmake.in
+@@ -71,6 +71,8 @@ if(APPLE)
+         set(__qt_internal_cmake_apple_support_files_path "${_qt_import_prefix}/ios")
+     elseif(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+         set(__qt_internal_cmake_apple_support_files_path "${_qt_import_prefix}/visionos")
++    elseif(CMAKE_SYSTEM_NAME STREQUAL "tvOS")
++        set(__qt_internal_cmake_apple_support_files_path "${_qt_import_prefix}/tvos")
+     endif()
+ endif()
+ 
+diff --git a/cmake/QtFrameworkHelpers.cmake b/cmake/QtFrameworkHelpers.cmake
+index cd76f011..39c9b01a 100644
+--- a/cmake/QtFrameworkHelpers.cmake
++++ b/cmake/QtFrameworkHelpers.cmake
+@@ -41,6 +41,10 @@ macro(qt_find_apple_system_frameworks)
+         qt_internal_find_apple_system_framework(FWUniformTypeIdentifiers UniformTypeIdentifiers)
+         qt_internal_find_apple_system_framework(FWNetwork Network)
+         qt_internal_find_apple_system_framework(FWOpenGL OpenGL)
++        if(TVOS)
++            # The tvOS SDK has no IOKit; Qt Core checks for its headers.
++            set(FWIOKit "")
++        endif()
+     endif()
+ endmacro()
+ 
+diff --git a/cmake/QtPriHelpers.cmake b/cmake/QtPriHelpers.cmake
+index 67fe8769..dd3b1e5f 100644
+--- a/cmake/QtPriHelpers.cmake
++++ b/cmake/QtPriHelpers.cmake
+@@ -825,6 +825,9 @@ QT_PATCH_VERSION = ${PROJECT_VERSION_PATCH}
+                  "QT_MAC_SDK_VERSION_MIN = ${QT_SUPPORTED_MIN_IOS_SDK_VERSION}")
+             list(APPEND extra_statements
+                  "QT_MAC_SDK_VERSION_MAX = ${QT_SUPPORTED_MAX_IOS_SDK_VERSION}")
++         elseif(CMAKE_SYSTEM_NAME STREQUAL tvOS)
++            list(APPEND extra_statements
++                "QMAKE_TVOS_DEPLOYMENT_TARGET = ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+          elseif(CMAKE_SYSTEM_NAME STREQUAL visionOS)
+             list(APPEND extra_statements
+                 "QMAKE_VISIONOS_DEPLOYMENT_TARGET = ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+diff --git a/cmake/QtPublicAppleHelpers.cmake b/cmake/QtPublicAppleHelpers.cmake
+index 5d90c454..17d995d2 100644
+--- a/cmake/QtPublicAppleHelpers.cmake
++++ b/cmake/QtPublicAppleHelpers.cmake
+@@ -789,6 +789,10 @@ function(_qt_internal_export_apple_sdk_and_xcode_version_requirements out_var)
+         QT_SUPPORTED_MIN_VISIONOS_XCODE_VERSION
+         QT_SUPPORTED_MIN_VISIONOS_VERSION
+         QT_SUPPORTED_MAX_VISIONOS_VERSION_TESTED
++        QT_SUPPORTED_MIN_TVOS_SDK_VERSION
++        QT_SUPPORTED_MAX_TVOS_SDK_VERSION
++        QT_SUPPORTED_MIN_TVOS_XCODE_VERSION
++        QT_SUPPORTED_MIN_TVOS_VERSION
+ 
+         QT_SUPPORTED_MIN_MACOS_SDK_VERSION
+         QT_SUPPORTED_MAX_MACOS_SDK_VERSION
+@@ -849,6 +853,12 @@ function(_qt_internal_get_apple_sdk_name out_var)
+             # Default case.
+             set(output_sdk_name "xros")
+         endif()
++    elseif(CMAKE_SYSTEM_NAME STREQUAL tvOS)
++        if(explicit_sdk_name STREQUAL "appletvos" OR explicit_sdk_name STREQUAL "appletvsimulator")
++            set(output_sdk_name "${explicit_sdk_name}")
++        else()
++            set(output_sdk_name "appletvos")
++        endif()
+     else()
+         # Default case.
+         set(output_sdk_name "macosx")
+@@ -1019,6 +1029,10 @@ function(_qt_internal_check_apple_sdk_and_xcode_versions)
+         set(min_sdk_version "${QT_SUPPORTED_MIN_VISIONOS_SDK_VERSION}")
+         set(max_sdk_version "${QT_SUPPORTED_MAX_VISIONOS_SDK_VERSION}")
+         set(min_xcode_version "${QT_SUPPORTED_MIN_VISIONOS_XCODE_VERSION}")
++    elseif(TVOS)
++        set(min_sdk_version "${QT_SUPPORTED_MIN_TVOS_SDK_VERSION}")
++        set(max_sdk_version "${QT_SUPPORTED_MAX_TVOS_SDK_VERSION}")
++        set(min_xcode_version "${QT_SUPPORTED_MIN_TVOS_XCODE_VERSION}")
+     else()
+         set(min_sdk_version "${QT_SUPPORTED_MIN_MACOS_SDK_VERSION}")
+         set(max_sdk_version "${QT_SUPPORTED_MAX_MACOS_SDK_VERSION}")
+diff --git a/cmake/QtPublicSbomDocumentNamespaceHelpers.cmake b/cmake/QtPublicSbomDocumentNamespaceHelpers.cmake
+index dc22999a..e28d5954 100644
+--- a/cmake/QtPublicSbomDocumentNamespaceHelpers.cmake
++++ b/cmake/QtPublicSbomDocumentNamespaceHelpers.cmake
+@@ -464,6 +464,8 @@ function(_qt_internal_sbom_get_target_platform_friendly_name out_var)
+             set(friendly_name "watchos")
+         elseif(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+             set(friendly_name "visionos")
++        elseif(CMAKE_SYSTEM_NAME STREQUAL "tvOS")
++            set(friendly_name "tvos")
+         else()
+             set(friendly_name "macos")
+         endif()
+diff --git a/cmake/tvos/Info.plist.app.in b/cmake/tvos/Info.plist.app.in
+new file mode 100644
+index 00000000..984b7aa1
+--- /dev/null
++++ b/cmake/tvos/Info.plist.app.in
+@@ -0,0 +1,50 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++    <key>CFBundleInfoDictionaryVersion</key>
++    <string>6.0</string>
++
++    <key>CFBundlePackageType</key>
++    <string>APPL</string>
++
++    <key>CFBundleName</key>
++    <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
++
++    <key>CFBundleDisplayName</key>
++    <string>${QT_INTERNAL_DOLLAR_VAR}{PRODUCT_NAME}</string>
++
++    <key>CFBundleIdentifier</key>
++    <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
++
++    <key>CFBundleExecutable</key>
++    <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
++
++    <key>CFBundleVersion</key>
++    <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
++
++    <key>CFBundleShortVersionString</key>
++    <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
++
++    <key>CFBundleIconFile</key>
++    <string>${MACOSX_BUNDLE_ICON_FILE}</string>
++
++    <key>CFBundleDevelopmentRegion</key>
++    <string>$(DEVELOPMENT_LANGUAGE)</string>
++    <key>CFBundleAllowMixedLocalizations</key>
++    <true/>
++
++    <key>CFBundleSupportedPlatforms</key>
++    <array>
++        <string>XROS</string>
++    </array>
++
++    <key>UIApplicationSceneManifest</key>
++    <dict>
++        <key>UIApplicationSupportsMultipleScenes</key>
++        <true/>
++        <key>UISceneConfigurations</key>
++        <dict/>
++    </dict>
++</dict>
++</plist>
+diff --git a/cmake/tvos/PrivacyInfo.xcprivacy b/cmake/tvos/PrivacyInfo.xcprivacy
+new file mode 100644
+index 00000000..d75908da
+--- /dev/null
++++ b/cmake/tvos/PrivacyInfo.xcprivacy
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++    <key>NSPrivacyTracking</key>
++    <false/>
++    <key>NSPrivacyCollectedDataTypes</key>
++    <array/>
++    <key>NSPrivacyTrackingDomains</key>
++    <array/>
++    <key>NSPrivacyAccessedAPITypes</key>
++    <array/>
++</dict>
++</plist>
+diff --git a/mkspecs/macx-tvos-clang/Info.plist.app b/mkspecs/macx-tvos-clang/Info.plist.app
+new file mode 100644
+index 00000000..9539cdb1
+--- /dev/null
++++ b/mkspecs/macx-tvos-clang/Info.plist.app
+@@ -0,0 +1,47 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++    <key>CFBundleDisplayName</key>
++    <string>${PRODUCT_NAME}</string>
++
++    <key>CFBundleExecutable</key>
++    <string>${EXECUTABLE_NAME}</string>
++
++    <key>CFBundleIconFile</key>
++    <string>${ASSETCATALOG_COMPILER_APPICON_NAME}</string>
++
++    <key>CFBundleIdentifier</key>
++    <string>${PRODUCT_BUNDLE_IDENTIFIER}</string>
++
++    <key>CFBundleName</key>
++    <string>${PRODUCT_NAME}</string>
++
++    <key>CFBundlePackageType</key>
++    <string>APPL</string>
++
++    <key>CFBundleShortVersionString</key>
++    <string>${QMAKE_SHORT_VERSION}</string>
++
++    <key>CFBundleVersion</key>
++    <string>${QMAKE_FULL_VERSION}</string>
++
++    <key>CFBundleDevelopmentRegion</key>
++    <string>$(DEVELOPMENT_LANGUAGE)</string>
++    <key>CFBundleAllowMixedLocalizations</key>
++    <true/>
++
++    <key>CFBundleSupportedPlatforms</key>
++    <array>
++        <string>XROS</string>
++    </array>
++
++    <key>UIApplicationSceneManifest</key>
++    <dict>
++        <key>UIApplicationSupportsMultipleScenes</key>
++        <true/>
++        <key>UISceneConfigurations</key>
++        <dict/>
++    </dict>
++</dict>
++</plist>
+diff --git a/mkspecs/macx-tvos-clang/Info.plist.dSYM.in b/mkspecs/macx-tvos-clang/Info.plist.dSYM.in
+new file mode 100644
+index 00000000..a8c8d0d4
+--- /dev/null
++++ b/mkspecs/macx-tvos-clang/Info.plist.dSYM.in
+@@ -0,0 +1,18 @@
++<?xml version=\"1.0\" encoding=\"UTF-8\"?>
++<!DOCTYPE plist PUBLIC \"-//Apple Computer//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
++<plist version=\"1.0\">
++	<dict>
++		<key>CFBundleIdentifier</key>
++		<string>com.apple.xcode.dsym.$${BUNDLEIDENTIFIER}</string>
++		<key>CFBundlePackageType</key>
++		<string>dSYM</string>
++		<key>CFBundleSignature</key>
++		<string>????</string>
++!!IF !isEmpty(VERSION)
++		<key>CFBundleShortVersionString</key>
++		<string>$${VER_MAJ}.$${VER_MIN}</string>
++		<key>CFBundleVersion</key>
++		<string>$${VER_MAJ}.$${VER_MIN}.$${VER_PAT}</string>
++!!ENDIF
++	</dict>
++</plist>
+diff --git a/mkspecs/macx-tvos-clang/Info.plist.lib b/mkspecs/macx-tvos-clang/Info.plist.lib
+new file mode 100644
+index 00000000..34752ec4
+--- /dev/null
++++ b/mkspecs/macx-tvos-clang/Info.plist.lib
+@@ -0,0 +1,20 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>CFBundleExecutable</key>
++	<string>${EXECUTABLE_NAME}</string>
++	<key>CFBundleIdentifier</key>
++	<string>${PRODUCT_BUNDLE_IDENTIFIER}</string>
++	<key>CFBundlePackageType</key>
++	<string>FMWK</string>
++	<key>CFBundleShortVersionString</key>
++	<string>${QMAKE_SHORT_VERSION}</string>
++	<key>CFBundleSignature</key>
++	<string>${QMAKE_PKGINFO_TYPEINFO}</string>
++	<key>CFBundleVersion</key>
++	<string>${QMAKE_FULL_VERSION}</string>
++	<key>NOTE</key>
++	<string>Please, do NOT change this file -- It was generated by Qt/QMake.</string>
++</dict>
++</plist>
+diff --git a/mkspecs/macx-tvos-clang/qmake.conf b/mkspecs/macx-tvos-clang/qmake.conf
+new file mode 100644
+index 00000000..1f84234f
+--- /dev/null
++++ b/mkspecs/macx-tvos-clang/qmake.conf
+@@ -0,0 +1,29 @@
++#
++# qmake configuration for tvOS
++#
++
++QMAKE_PLATFORM         += tvos
++QMAKE_MAC_SDK           = appletvos
++
++device.sdk = appletvos
++device.target = device
++device.dir_affix = $${device.sdk}
++device.CONFIG = $${device.sdk}
++device.deployment_identifier =
++
++simulator.sdk = appletvsimulator
++simulator.target = simulator
++simulator.dir_affix = $${simulator.sdk}
++simulator.CONFIG = $${simulator.sdk}
++simulator.deployment_identifier =
++
++QMAKE_APPLE_TARGETED_DEVICE_FAMILY = 3
++
++include(../common/uikit.conf)
++include(../common/gcc-base-mac.conf)
++include(../common/clang.conf)
++include(../common/clang-mac.conf)
++include(../common/uikit/clang.conf)
++include(../common/uikit/qmake.conf)
++
++load(qt_config)
+diff --git a/mkspecs/macx-tvos-clang/qplatformdefs.h b/mkspecs/macx-tvos-clang/qplatformdefs.h
+new file mode 100644
+index 00000000..3c0fa239
+--- /dev/null
++++ b/mkspecs/macx-tvos-clang/qplatformdefs.h
+@@ -0,0 +1,4 @@
++// Copyright (C) 2016 The Qt Company Ltd.
++// SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
++
++#include "../common/mac/qplatformdefs.h"
+diff --git a/src/corelib/io/qfilesystemengine_mac.mm b/src/corelib/io/qfilesystemengine_mac.mm
+index d44711dd..4edd8a0e 100644
+--- a/src/corelib/io/qfilesystemengine_mac.mm
++++ b/src/corelib/io/qfilesystemengine_mac.mm
+@@ -24,13 +24,24 @@
+ //static
+ bool QFileSystemEngine::supportsMoveFileToTrash()
+ {
++#ifdef Q_OS_TVOS
++    return false;
++#else
+     return true;
++#endif
+ }
+ 
+ //static
+ bool QFileSystemEngine::moveFileToTrash(const QFileSystemEntry &source,
+                                         QFileSystemEntry &newLocation, QSystemError &error)
+ {
++#ifdef Q_OS_TVOS
++    // tvOS has no trash.
++    Q_UNUSED(source);
++    Q_UNUSED(newLocation);
++    error = QSystemError(ENOSYS, QSystemError::StandardLibraryError);
++    return false;
++#else
+     QMacAutoReleasePool pool;
+ 
+     QFileInfo info(source.filePath());
+@@ -45,6 +56,7 @@
+     }
+     newLocation = QFileSystemEntry(QUrl::fromNSURL(resultingUrl).path());
+     return true;
++#endif
+ }
+ 
+ QT_END_NAMESPACE

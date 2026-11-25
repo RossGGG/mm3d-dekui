@@ -1,0 +1,63 @@
+diff --git a/src/plugins/platforms/ios/SwiftIntegration.cmake b/src/plugins/platforms/ios/SwiftIntegration.cmake
+index 01bb8429..d9f6e065 100644
+--- a/src/plugins/platforms/ios/SwiftIntegration.cmake
++++ b/src/plugins/platforms/ios/SwiftIntegration.cmake
+@@ -2,7 +2,7 @@
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+ set(CMAKE_Swift_COMPILER_TARGET arm64-apple-xros)
+-if($CACHE{CMAKE_OSX_SYSROOT} MATCHES "^[a-z]+simulator$")
++if($CACHE{CMAKE_OSX_SYSROOT} MATCHES "^[a-z]+simulator$|[/]XRSimulator[^/]*[.]sdk$")
+     set(CMAKE_Swift_COMPILER_TARGET "${CMAKE_Swift_COMPILER_TARGET}-simulator")
+ endif()
+ 
+@@ -19,6 +19,27 @@ get_target_property(QT_GUI_INCLUDES Qt6::Gui INTERFACE_INCLUDE_DIRECTORIES)
+ get_target_property(QT_CORE_PRIVATE_INCLUDES Qt6::CorePrivate INTERFACE_INCLUDE_DIRECTORIES)
+ get_target_property(QT_GUI_PRIVATE_INCLUDES Qt6::GuiPrivate INTERFACE_INCLUDE_DIRECTORIES)
+ 
++# Swift's -I searches Swift modules. Forward the same paths to the Clang
++# importer as well so the generated Objective-C module can resolve Qt's QPA
++# and private C++ headers.
++set(SWIFT_BUILD_INCLUDE_DIRS
++    "${CMAKE_BINARY_DIR}/include"
++    "${CMAKE_BINARY_DIR}/include/QtCore"
++    "${CMAKE_BINARY_DIR}/include/QtGui"
++    "${CMAKE_BINARY_DIR}/include/QtCore/${PROJECT_VERSION}"
++    "${CMAKE_BINARY_DIR}/include/QtCore/${PROJECT_VERSION}/QtCore"
++    "${CMAKE_BINARY_DIR}/include/QtGui/${PROJECT_VERSION}"
++    "${CMAKE_BINARY_DIR}/include/QtGui/${PROJECT_VERSION}/QtGui"
++    "${CMAKE_BINARY_DIR}/src/corelib"
++    "${CMAKE_BINARY_DIR}/src/gui"
++)
++set(SWIFT_INCLUDE_ARGS)
++set(SWIFT_CXX_INCLUDE_ARGS)
++foreach(include_dir IN LISTS SWIFT_BUILD_INCLUDE_DIRS)
++    list(APPEND SWIFT_INCLUDE_ARGS "-I${include_dir}")
++    list(APPEND SWIFT_CXX_INCLUDE_ARGS -Xcc "-I${include_dir}")
++endforeach()
++
+ set(target QIOSIntegrationPluginSwift)
+ # Swift library
+ set(SWIFT_SOURCES
+@@ -41,19 +62,13 @@ target_compile_options(${target} PRIVATE
+ 
+ # Swift to C++ bridging header
+ set(SWIFT_BRIDGING_HEADER "${CMAKE_CURRENT_BINARY_DIR}/qiosswiftintegration.h")
+-list(TRANSFORM QT_CORE_INCLUDES PREPEND "-I")
+-list(TRANSFORM QT_GUI_INCLUDES PREPEND "-I")
+-list(TRANSFORM QT_CORE_PRIVATE_INCLUDES PREPEND "-I")
+-list(TRANSFORM QT_GUI_PRIVATE_INCLUDES PREPEND "-I")
+ add_custom_command(
+     COMMAND
+       ${CMAKE_Swift_COMPILER} -frontend -typecheck
+       ${SWIFT_SOURCES}
+       -I ${CMAKE_CURRENT_SOURCE_DIR}
+-      ${QT_CORE_INCLUDES}
+-      ${QT_GUI_INCLUDES}
+-      ${QT_CORE_PRIVATE_INCLUDES}
+-      ${QT_GUI_PRIVATE_INCLUDES}
++      ${SWIFT_INCLUDE_ARGS}
++      ${SWIFT_CXX_INCLUDE_ARGS}
+       -sdk ${CMAKE_OSX_SYSROOT}
+       -module-name ${target}
+       -cxx-interoperability-mode=default

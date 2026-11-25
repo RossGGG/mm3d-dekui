@@ -16,8 +16,8 @@ target_sources(mm3d_overlay PRIVATE link_pose_capture.cpp link_pose_capture.h ef
 target_sources(mm3d_overlay PRIVATE profiles.cpp profiles.h classic_saving.cpp classic_saving.h)
 target_link_libraries(mm3d_overlay PUBLIC mm3d_imgui PRIVATE citra_common Qt6::Core nihstro-headers)
 
-if (ANDROID)
-    # Desktop test executables and window fixtures do not belong in the APK.
+if (ANDROID OR CITRA_VISIONOS OR CITRA_TVOS)
+    # Desktop test executables and window fixtures do not belong in a mobile app bundle.
     return()
 endif()
 

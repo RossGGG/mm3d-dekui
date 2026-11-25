@@ -1047,7 +1047,7 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
                                                 program_offset);
 
     // Copy to executable memory
-    std::memcpy(code_mem->ptr(), code_vec.data(), code_vec.size() * sizeof(u32));
+    std::memcpy(code_mem->wptr(), code_vec.data(), code_vec.size() * sizeof(u32));
 
     // Memory is ready to execute
     code_mem->protect();

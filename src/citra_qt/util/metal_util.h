@@ -7,5 +7,6 @@
 namespace MetalUtil {
 
 void* CreateMetalLayer(WId window);
+void ResizeMetalLayer(void* layer, WId window);
 
 }

@@ -7,6 +7,8 @@
 # Shared setting keys (multi-platform)
 foreach(KEY IN ITEMS
     "use_artic_base_controller"
+    "motion_source"
+    "motion_sensitivity"
     "enable_gamemode"
     "use_cpu_jit"
     "cpu_clock_percentage"
@@ -165,7 +167,7 @@ endforeach()
 #       E.g. UILayout\geometry
 # TODO: We should probably get rid of these groups and use complete keys at some point. -OS
 # FIXME: Some of these settings don't use the standard snake_case. When we can migrate, address that. -OS
-if (ENABLE_QT)
+if (ENABLE_QT OR ENABLE_DEKUI_SWIFTUI)
     foreach(KEY IN ITEMS
         "nickname"
         "ip"
@@ -312,7 +314,7 @@ string(SUBSTRING "${SETTING_KEY_LIST}" 0 ${SETTING_KEY_LIST_NEW_LENGTH} SETTING_
 
 # Configure files
 configure_file("common/setting_keys.h.in" "common/setting_keys.h" @ONLY)
-if (ENABLE_QT)
+if (ENABLE_QT OR ENABLE_DEKUI_SWIFTUI)
     configure_file("citra_qt/setting_qkeys.h.in" "citra_qt/setting_qkeys.h" @ONLY)
 endif()
 if (ANDROID AND NOT ENABLE_LIBRETRO)

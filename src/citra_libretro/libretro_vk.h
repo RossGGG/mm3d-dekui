@@ -87,6 +87,8 @@ std::unique_ptr<MasterSemaphore> CreateLibRetroMasterSemaphore(const Instance& i
 struct Frame {
     u32 width;
     u32 height;
+    /// 2 when the frame holds both eyes side by side.
+    u32 eyes{1};
     VmaAllocation allocation;
     vk::Framebuffer framebuffer;
     vk::Image image;

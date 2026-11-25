@@ -21,13 +21,48 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modul
 include(DownloadExternals)
 include(CMakeDependentOption)
 
+set(CITRA_VISIONOS OFF)
+if (CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+    set(CITRA_VISIONOS ON)
+    add_compile_definitions(CITRA_VISIONOS=1)
+endif()
+# Apple TV: the native SwiftUI app without any JIT (interpreter plus AOT code).
+set(CITRA_TVOS OFF)
+if (CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+    set(CITRA_TVOS ON)
+    add_compile_definitions(CITRA_TVOS=1)
+endif()
+
 project(citra LANGUAGES C CXX ASM)
 # must be invoked after project() command when using CMAKE_TOOLCHAIN_FILE
 include(FindPkgConfig)
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR
+    CMAKE_SYSTEM_NAME STREQUAL "iOS" OR
+    CITRA_VISIONOS OR CITRA_TVOS)
     enable_language(OBJC OBJCXX)
 endif()
 
+# The dedicated Apple TV build currently targets the first-generation 4K's
+# A10X. AppleClang otherwise emits code for the much older Apple A7 baseline.
+# Keep this configurable so a distributable build can select a different
+# baseline without changing source.
+set(DEKUI_TVOS_CPU "apple-a10" CACHE STRING
+    "AppleClang CPU used by tvOS device builds (empty for Apple's baseline)")
+if (CITRA_TVOS AND DEKUI_TVOS_CPU AND
+    CMAKE_OSX_ARCHITECTURES MATCHES "arm64" AND
+    NOT CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-mcpu=${DEKUI_TVOS_CPU}>")
+    message(STATUS "tvOS device CPU target: ${DEKUI_TVOS_CPU}")
+endif()
+
+# Test MoltenVK's asynchronous queue processing independently from CPU/AOT
+# optimization. MoltenVK reads this setting before the Vulkan instance exists.
+option(DEKUI_TVOS_ASYNC_MOLTENVK_SUBMITS
+    "Dispatch tvOS MoltenVK queue submissions asynchronously" OFF)
+if (DEKUI_TVOS_ASYNC_MOLTENVK_SUBMITS AND NOT CITRA_TVOS)
+    message(FATAL_ERROR "DEKUI_TVOS_ASYNC_MOLTENVK_SUBMITS is only valid for tvOS")
+endif()
 if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND MINGW)
     string(TOLOWER ${LIBTYPE} LIBTYPE_LOWER)
     set(CMAKE_AR x86_64-w64-mingw32.${LIBTYPE_LOWER}-gcc-ar)
@@ -57,6 +92,20 @@ if (APPLE AND NOT ENABLE_LIBRETRO)
         set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
 
         # Enable searching CMAKE_PREFIX_PATH for bundled dependencies.
+        set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
+        set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
+        set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+    elseif (CITRA_VISIONOS)
+        # Minimum visionOS 2.0. Qt for visionOS is supplied by the caller.
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "2.0")
+
+        set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
+        set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
+        set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+    elseif (CITRA_TVOS)
+        # Minimum tvOS 17. Qt Core for tvOS comes from tools/visionos/build-qt.sh.
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "17.0")
+
         set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
         set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
         set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
@@ -124,18 +173,23 @@ option(ENABLE_QT "Enable the Qt frontend" ON)
 option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" ON)
 option(ENABLE_QT_UPDATE_CHECKER "Enable built-in update checker for the Qt frontend" OFF)
 
-CMAKE_DEPENDENT_OPTION(ENABLE_TESTS "Enable generating tests executable" ON "NOT IOS" OFF)
-CMAKE_DEPENDENT_OPTION(ENABLE_ROOM "Enable dedicated room functionality" ON "NOT ANDROID AND NOT IOS" OFF)
+CMAKE_DEPENDENT_OPTION(ENABLE_TESTS "Enable generating tests executable" ON "NOT IOS AND NOT CITRA_VISIONOS AND NOT CITRA_TVOS" OFF)
+CMAKE_DEPENDENT_OPTION(ENABLE_ROOM "Enable dedicated room functionality" ON "NOT ANDROID AND NOT IOS AND NOT CITRA_VISIONOS AND NOT CITRA_TVOS" OFF)
 CMAKE_DEPENDENT_OPTION(ENABLE_ROOM_STANDALONE "Enable generating a standalone dedicated room executable" ON "ENABLE_ROOM" OFF)
 
 option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
 option(ENABLE_SCRIPTING "Enable RPC server for scripting" ON)
 option(ENABLE_GDBSTUB "Enable GDB stub for emulated applications" ON)
+if (CITRA_VISIONOS OR CITRA_TVOS)
+    # Nothing can reach the GDB stub on the headset, and the interpreter checks
+    # for its breakpoints on every instruction.
+    set(ENABLE_GDBSTUB OFF CACHE BOOL "" FORCE)
+endif()
 
-CMAKE_DEPENDENT_OPTION(ENABLE_CUBEB "Enables the cubeb audio backend" ON "NOT IOS" OFF)
+CMAKE_DEPENDENT_OPTION(ENABLE_CUBEB "Enables the cubeb audio backend" ON "NOT IOS AND NOT CITRA_VISIONOS AND NOT CITRA_TVOS" OFF)
 option(ENABLE_OPENAL "Enables the OpenAL audio backend" ON)
 
-CMAKE_DEPENDENT_OPTION(ENABLE_LIBUSB "Enable libusb for GameCube Adapter support" ON "NOT IOS" OFF)
+CMAKE_DEPENDENT_OPTION(ENABLE_LIBUSB "Enable libusb for GameCube Adapter support" ON "NOT IOS AND NOT CITRA_VISIONOS AND NOT CITRA_TVOS" OFF)
 
 CMAKE_DEPENDENT_OPTION(ENABLE_SOFTWARE_RENDERER "Enables the software renderer" ON "NOT ANDROID" OFF)
 CMAKE_DEPENDENT_OPTION(ENABLE_OPENGL "Enables the OpenGL renderer" ${DEFAULT_ENABLE_OPENGL} "NOT APPLE" OFF)
@@ -152,10 +206,17 @@ option(ENABLE_DEVELOPER_OPTIONS "Enable functionality targeted at emulator devel
 
 option(ENABLE_MM3D_GAME_FOLDER "Require verified game/mm3d.cci and isolated portable MM3D setup" OFF)
 option(ENABLE_MM3D_PRESENTATION "Build the dedicated MM3D Vulkan developer presentation slice" OFF)
+CMAKE_DEPENDENT_OPTION(ENABLE_DEKUI_SWIFTUI "Build Dekui's native SwiftUI app (visionOS or tvOS)" OFF "CITRA_VISIONOS OR CITRA_TVOS" OFF)
+if (ENABLE_DEKUI_SWIFTUI AND NOT (ENABLE_MM3D_PRESENTATION AND ENABLE_MM3D_GAME_FOLDER))
+    message(FATAL_ERROR "The SwiftUI app requires ENABLE_MM3D_PRESENTATION and ENABLE_MM3D_GAME_FOLDER")
+endif()
 if (ENABLE_MM3D_PRESENTATION)
-    if ((NOT ENABLE_QT AND NOT ANDROID) OR NOT ENABLE_VULKAN OR ENABLE_LIBRETRO)
-        message(FATAL_ERROR "MM3D presentation requires Vulkan and a Qt or Android frontend (not libretro)")
+    if ((NOT ENABLE_QT AND NOT ANDROID AND NOT ENABLE_DEKUI_SWIFTUI) OR NOT ENABLE_VULKAN OR ENABLE_LIBRETRO)
+        message(FATAL_ERROR "MM3D presentation requires Vulkan and a Qt, Android or SwiftUI frontend (not libretro)")
     endif()
+endif()
+if (ENABLE_DEKUI_SWIFTUI)
+    enable_language(Swift)
 endif()
 
 if (ENABLE_MM3D_GAME_FOLDER)
@@ -392,14 +453,20 @@ endif()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-if (ENABLE_MM3D_PRESENTATION AND ANDROID AND NOT ENABLE_QT)
+if (ENABLE_MM3D_PRESENTATION AND (ANDROID OR ENABLE_DEKUI_SWIFTUI) AND NOT ENABLE_QT)
     # The Android frontend remains Kotlin/JNI. Presentation uses only Qt Core
     # for JSON/files; do not download desktop Qt or require Qt Widgets/DBus.
-    # Qt6_DIR must point to an Android Qt SDK matching the selected ABI.
+    # Qt6_DIR must point to an Android Qt SDK matching the selected ABI. The
+    # SwiftUI visionOS app likewise needs only a visionOS Qt Core.
     find_package(Qt6 REQUIRED COMPONENTS Core)
 endif()
 
 if (ENABLE_QT)
+    if (CITRA_VISIONOS AND NOT USE_SYSTEM_QT)
+        message(FATAL_ERROR
+            "Native visionOS builds require a Qt build targeting visionOS. "
+            "Set USE_SYSTEM_QT=ON and point CMAKE_PREFIX_PATH/QT_HOST_PATH at that build.")
+    endif()
     if (NOT USE_SYSTEM_QT)
         download_qt(6.10.3)
     endif()
@@ -442,7 +509,7 @@ find_package(tsl-robin-map QUIET)
 # ======================================
 
 if (APPLE)
-    if (NOT IOS)
+    if (NOT IOS AND NOT CITRA_VISIONOS AND NOT CITRA_TVOS)
         # Umbrella framework for everything GUI-related
         find_library(COCOA_LIBRARY Cocoa REQUIRED)
     endif()
@@ -455,7 +522,19 @@ if (APPLE)
             find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
         else()
             download_moltenvk()
-            if (IOS)
+            if (CITRA_VISIONOS)
+                if (CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+                    set(MOLTENVK_RELATIVE_LIBPATH "static/MoltenVK.xcframework/xros-arm64_x86_64-simulator/libMoltenVK.a")
+                else()
+                    set(MOLTENVK_RELATIVE_LIBPATH "static/MoltenVK.xcframework/xros-arm64/libMoltenVK.a")
+                endif()
+            elseif (CITRA_TVOS)
+                if (CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+                    set(MOLTENVK_RELATIVE_LIBPATH "static/MoltenVK.xcframework/tvos-arm64_x86_64-simulator/libMoltenVK.a")
+                else()
+                    set(MOLTENVK_RELATIVE_LIBPATH "static/MoltenVK.xcframework/tvos-arm64_arm64e/libMoltenVK.a")
+                endif()
+            elseif (IOS)
                 set(MOLTENVK_RELATIVE_LIBPATH "static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a")
             else()
                 set(MOLTENVK_RELATIVE_LIBPATH "dynamic/dylib/macOS/libMoltenVK.dylib")
@@ -616,7 +695,7 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT c
 
 # Create target for outputting distributable bundles.
 # Not supported for mobile platforms as distributables are built differently.
-if (NOT ANDROID AND NOT IOS)
+if (NOT ANDROID AND NOT IOS AND NOT CITRA_VISIONOS AND NOT CITRA_TVOS)
     include(BundleTarget)
     if (ENABLE_QT)
         qt_bundle_target(citra_meta)

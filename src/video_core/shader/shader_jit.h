@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include "common/common_types.h"
 #include "video_core/shader/shader.h"
+#include "video_core/shader/shader_interpreter.h"
 
 namespace Pica::Shader {
 
@@ -25,7 +26,10 @@ public:
     void Run(const ShaderSetup& setup, ShaderUnit& state) const override;
 
 private:
+    // A null entry marks a shader that could not get executable memory; it
+    // runs on the interpreter instead.
     std::unordered_map<u64, std::unique_ptr<JitShader>> cache;
+    InterpreterEngine fallback;
 };
 
 } // namespace Pica::Shader

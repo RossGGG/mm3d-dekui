@@ -67,6 +67,21 @@ std::vector<SinkDetails> ListSinks() {
 }
 
 const SinkDetails& GetSinkDetails(SinkType sink_type) {
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+    // OpenAL Soft currently aborts while creating its context on physical
+    // visionOS hardware. SDL's CoreAudio backend uses AVAudioSession and
+    // AudioQueue, both of which are available on visionOS, so route every
+    // enabled output selection through it. Preserve an explicit "None".
+    if (sink_type != SinkType::Null) {
+        LOG_INFO(Audio, "Using SDL2/CoreAudio output on visionOS");
+#ifdef HAVE_SDL2
+        sink_type = SinkType::SDL2;
+#else
+        LOG_ERROR(Audio, "SDL2 audio support is unavailable; disabling visionOS audio output");
+        sink_type = SinkType::Null;
+#endif
+    }
+#endif
     auto iter = std::find_if(
         sink_details.begin(), sink_details.end(),
         [sink_type](const auto& sink_detail) { return sink_detail.type == sink_type; });

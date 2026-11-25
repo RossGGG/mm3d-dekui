@@ -5,6 +5,8 @@
     <!-- Templated data -->
     <key>CFBundleName</key>
     <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
+    <key>CFBundleDisplayName</key>
+    <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
     <key>CFBundleIdentifier</key>
     <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
     <key>CFBundleVersion</key>
@@ -80,7 +82,6 @@
     <string>True</string>
     <key>UIFileSharingEnabled</key>
     <true/>
-    <key>UILaunchStoryboardName</key>
-    <string>LaunchScreen</string>
+${APPLE_PLATFORM_INFO_PLIST}
 </dict>
 </plist>

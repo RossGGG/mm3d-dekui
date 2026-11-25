@@ -79,6 +79,14 @@ std::vector<InputDetails> ListInputs() {
 }
 
 const InputDetails& GetInputDetails(InputType input_type) {
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+    // Match the null output fallback. Microphone support needs a native
+    // visionOS capture backend rather than OpenAL Soft's threaded backend.
+    if (input_type != InputType::Null) {
+        LOG_WARNING(Audio, "Audio input is disabled on visionOS");
+        input_type = InputType::Null;
+    }
+#endif
     auto iter = std::find_if(
         input_details.begin(), input_details.end(),
         [input_type](const auto& input_detail) { return input_detail.type == input_type; });

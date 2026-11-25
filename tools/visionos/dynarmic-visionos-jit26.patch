@@ -1,0 +1,72 @@
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae777..029799c8 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -23,7 +23,7 @@ namespace Dynarmic::Backend::Arm64 {
+ AddressSpace::AddressSpace(size_t code_cache_size)
+         : code_cache_size(code_cache_size)
+         , mem(code_cache_size)
+-        , code(mem.ptr(), mem.ptr())
++        , code(mem.wptr(), mem.ptr())
+         , fastmem_manager(exception_handler) {
+     ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
+ 
+@@ -136,7 +136,7 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, target] : block_info.relocations) {
+-        CodeGenerator c{mem.ptr(), mem.ptr()};
++        CodeGenerator c{mem.wptr(), mem.ptr()};
+         c.set_xptr(reinterpret_cast<u32*>(block_info.entry_point + ptr_offset));
+ 
+         switch (target) {
+@@ -276,7 +276,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, type] : block_relocations_list) {
+-        CodeGenerator c{mem.ptr(), mem.ptr()};
++        CodeGenerator c{mem.wptr(), mem.ptr()};
+         c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
+ 
+         switch (type) {
+diff --git a/src/dynarmic/common/spin_lock_arm64.cpp b/src/dynarmic/common/spin_lock_arm64.cpp
+index ccf807e2..fa4c04e7 100644
+--- a/src/dynarmic/common/spin_lock_arm64.cpp
++++ b/src/dynarmic/common/spin_lock_arm64.cpp
+@@ -37,6 +37,7 @@ void EmitSpinLockUnlock(oaknut::CodeGenerator& code, oaknut::XReg ptr) {
+ 
+ namespace {
+ 
++#if !defined(CITRA_VISIONOS)
+ struct SpinLockImpl {
+     SpinLockImpl();
+ 
+@@ -70,17 +71,28 @@ void SpinLockImpl::Initialize() {
+     mem.protect();
+     mem.invalidate_all();
+ }
++#endif
+ 
+ }  // namespace
+ 
+ void SpinLock::Lock() {
++#if defined(CITRA_VISIONOS)
++    while (__atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE) != 0) {
++        __asm__ volatile("yield");
++    }
++#else
+     std::call_once(flag, &SpinLockImpl::Initialize, impl);
+     impl.lock(&storage);
++#endif
+ }
+ 
+ void SpinLock::Unlock() {
++#if defined(CITRA_VISIONOS)
++    __atomic_store_n(&storage, 0, __ATOMIC_RELEASE);
++#else
+     std::call_once(flag, &SpinLockImpl::Initialize, impl);
+     impl.unlock(&storage);
++#endif
+ }
+ 
+ }  // namespace Dynarmic

@@ -5,6 +5,9 @@
 #include <string>
 #include <vector>
 #include <SDL.h>
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+#include <SDL_main.h>
+#endif
 #include "audio_core/audio_types.h"
 #include "audio_core/sdl2_sink.h"
 #include "common/assert.h"
@@ -23,6 +26,11 @@ struct SDL2Sink::Impl {
 };
 
 SDL2Sink::SDL2Sink(std::string device_name) : impl(std::make_unique<Impl>()) {
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+    // The visionOS frontend is launched by Qt/UIKit rather than SDL_main. SDL's
+    // Apple bootstrap otherwise rejects SDL_Init before it reaches CoreAudio.
+    SDL_SetMainReady();
+#endif
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         LOG_CRITICAL(Audio_Sink, "SDL_Init(SDL_INIT_AUDIO) failed with: {}", SDL_GetError());
         impl->audio_device_id = 0;
@@ -34,7 +42,13 @@ SDL2Sink::SDL2Sink(std::string device_name) : impl(std::make_unique<Impl>()) {
     desired_audiospec.format = AUDIO_S16;
     desired_audiospec.channels = 2;
     desired_audiospec.freq = native_sample_rate;
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+    // visionOS resamples to the 48 kHz session rate and emulation can stall
+    // briefly (area loads, shader compiles); a deeper buffer avoids crackle.
+    desired_audiospec.samples = 2048;
+#else
     desired_audiospec.samples = 512;
+#endif
     desired_audiospec.userdata = impl.get();
     desired_audiospec.callback = &Impl::Callback;
 

@@ -459,6 +459,9 @@ bool Instance::CreateDevice() {
         add_extension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, is_qualcomm || is_turnip,
                       "it is broken on Qualcomm drivers");
     const bool has_portability_subset = add_extension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+#ifdef __APPLE__
+    metal_objects = add_extension("VK_EXT_metal_objects");
+#endif
     const bool has_extended_dynamic_state =
         add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, is_arm || is_qualcomm,
                       "it is broken on Qualcomm and ARM drivers");
@@ -529,6 +532,7 @@ bool Instance::CreateDevice() {
                 .robustBufferAccess = features.robustBufferAccess,
                 .geometryShader = features.geometryShader,
                 .logicOp = features.logicOp,
+                .depthClamp = features.depthClamp,
                 .samplerAnisotropy = features.samplerAnisotropy,
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderClipDistance = features.shaderClipDistance,

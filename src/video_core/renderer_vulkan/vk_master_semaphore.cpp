@@ -99,6 +99,8 @@ void MasterSemaphoreTimeline::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore
         instance.GetGraphicsQueue().submit(submit_info);
     } catch (vk::DeviceLostError& err) {
         UNREACHABLE_MSG("Device lost during submit: {}", err.what());
+    } catch (vk::SystemError& err) {
+        UNREACHABLE_MSG("Queue submit failed: {}", err.what());
     }
 }
 
@@ -151,6 +153,8 @@ void MasterSemaphoreFence::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore wa
         instance.GetGraphicsQueue().submit(submit_info, fence);
     } catch (vk::DeviceLostError& err) {
         UNREACHABLE_MSG("Device lost during submit: {}", err.what());
+    } catch (vk::SystemError& err) {
+        UNREACHABLE_MSG("Queue submit failed: {}", err.what());
     }
 
     std::scoped_lock lock{wait_mutex};

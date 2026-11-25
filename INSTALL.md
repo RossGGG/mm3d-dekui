@@ -61,3 +61,10 @@ For an optional texture pack, use **Graphics → Open texture folder**, install 
 Back up `user/` before updating. Preserve your game and the entire `user/` folder, including saves. Replace application files with the complete new package; keep its runtime and resource folders together.
 
 Setup refuses to overwrite existing user data. If setup reports an incomplete or incompatible installation, preserve that folder and try a fresh application folder. Do not delete saves to troubleshoot.
+
+## visionOS development
+
+The visionOS port is under development. The emulator core currently builds for
+the simulator and physical devices, but there is not yet an installable DekUI
+application. See [docs/visionos.md](docs/visionos.md) for verified build commands
+and the remaining frontend work.
