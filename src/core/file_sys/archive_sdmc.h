@@ -9,6 +9,7 @@
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/export.hpp>
 #include <boost/serialization/string.hpp>
+#include "common/file_util.h"
 #include "core/file_sys/archive_backend.h"
 #include "core/hle/result.h"
 
@@ -47,7 +48,7 @@ protected:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<ArchiveBackend>(*this);
-        ar & mount_point;
+        ar& FileUtil::Path::make(mount_point); // Host path, stored portably.
     }
     friend class boost::serialization::access;
 };
@@ -79,7 +80,7 @@ private:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<ArchiveFactory>(*this);
-        ar & sdmc_directory;
+        ar& FileUtil::Path::make(sdmc_directory); // Host path, stored portably.
     }
     friend class boost::serialization::access;
 };

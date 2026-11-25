@@ -8,6 +8,7 @@
 #include <string>
 #include <boost/serialization/export.hpp>
 #include <boost/serialization/string.hpp>
+#include "common/file_util.h"
 #include "common/common_types.h"
 #include "core/file_sys/archive_backend.h"
 #include "core/file_sys/artic_cache.h"
@@ -56,7 +57,7 @@ private:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<ArchiveFactory>(*this);
-        ar & base_path;
+        ar& FileUtil::Path::make(base_path); // Host path, stored portably.
     }
     friend class boost::serialization::access;
 };

@@ -138,9 +138,13 @@ public:
     /// Shutdown and then load again
     void Reset();
 
-    enum class Signal : u32 { None, Shutdown, Reset, Save, Load };
+    enum class Signal : u32 { None, Shutdown, Reset, Save, Load, SaveFile, LoadFile };
 
     bool SendSignal(Signal signal, u32 param = 0);
+
+    /// Saves to or loads from a state file (Signal::SaveFile / LoadFile) on
+    /// the emulation thread, like SendSignal does for numbered slots.
+    bool SendFileSignal(Signal signal, std::string path);
 
     /// Request reset of the system
     void RequestReset(const std::string& chainload = "", std::optional<u8> mem_mode = {}) {
@@ -372,6 +376,10 @@ public:
 
     void LoadState(u32 slot);
 
+    void SaveStateToFile(const std::string& path) const;
+
+    void LoadStateFromFile(const std::string& path);
+
     std::vector<u8> SaveStateBuffer() const;
 
     bool LoadStateBuffer(std::vector<u8> buffer);
@@ -517,6 +525,8 @@ private:
     SaveStateStatus save_state_status = SaveStateStatus::NONE;
     SaveStateStatus save_state_request_status = SaveStateStatus::NONE;
     u32 save_state_slot = 0;
+    /// Set for file requests; numbered slots use save_state_slot.
+    std::string save_state_path;
     std::chrono::steady_clock::time_point save_state_request_time{};
 
     ResultStatus status = ResultStatus::Success;
@@ -532,6 +542,7 @@ private:
     std::mutex signal_mutex;
     Signal current_signal;
     u32 signal_param;
+    std::string signal_path;
 
     std::function<bool()> mic_permission_func;
     bool mic_permission_granted = false;

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "common/file_util.h"
 #include "core/file_sys/archive_sdmc.h"
 
 namespace FileSys {
@@ -65,7 +66,7 @@ private:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<ArchiveFactory>(*this);
-        ar & sdmc_directory;
+        ar& FileUtil::Path::make(sdmc_directory); // Host path, stored portably.
     }
     friend class boost::serialization::access;
 };

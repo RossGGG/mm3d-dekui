@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include "common/file_util.h"
 #include "core/file_sys/archive_backend.h"
 #include "core/file_sys/directory_backend.h"
 #include "core/file_sys/file_backend.h"
@@ -43,7 +44,7 @@ private:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<ArchiveBackend>(*this);
-        ar & mount_point;
+        ar& FileUtil::Path::make(mount_point); // Host path, stored portably.
         ar & allow_zero_size_create;
     }
     friend class boost::serialization::access;

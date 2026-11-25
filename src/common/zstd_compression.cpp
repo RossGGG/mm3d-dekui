@@ -11,6 +11,8 @@
 #include <ctime>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <zstd.h>
 #include <zstd_seekable.h>
 
@@ -46,6 +48,88 @@ std::vector<u8> CompressDataZSTD(std::span<const u8> source, s32 compression_lev
 
     compressed.resize(compressed_size);
     return compressed;
+}
+
+ZSTDCompressingBuffer::ZSTDCompressingBuffer()
+    : context{ZSTD_createCCtx()}, input(1 << 20) {
+    ZSTD_CCtx_setParameter(static_cast<ZSTD_CCtx*>(context), ZSTD_c_compressionLevel,
+                           ZSTD_CLEVEL_DEFAULT);
+    setp(input.data(), input.data() + input.size());
+}
+
+ZSTDCompressingBuffer::~ZSTDCompressingBuffer() {
+    ZSTD_freeCCtx(static_cast<ZSTD_CCtx*>(context));
+}
+
+std::vector<u8> ZSTDCompressingBuffer::Finish() {
+    Compress(true);
+    return std::move(output);
+}
+
+ZSTDCompressingBuffer::int_type ZSTDCompressingBuffer::overflow(int_type ch) {
+    Compress(false);
+    if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+        *pptr() = traits_type::to_char_type(ch);
+        pbump(1);
+    }
+    return traits_type::not_eof(ch);
+}
+
+void ZSTDCompressingBuffer::Compress(bool end) {
+    ZSTD_inBuffer in{input.data(), static_cast<std::size_t>(pptr() - pbase()), 0};
+    for (;;) {
+        const std::size_t chunk = ZSTD_CStreamOutSize();
+        const std::size_t used = output.size();
+        output.resize(used + chunk);
+        ZSTD_outBuffer out{output.data() + used, chunk, 0};
+        const std::size_t remaining = ZSTD_compressStream2(
+            static_cast<ZSTD_CCtx*>(context), &out, &in, end ? ZSTD_e_end : ZSTD_e_continue);
+        output.resize(used + out.pos);
+        if (ZSTD_isError(remaining)) {
+            throw std::runtime_error(std::string{"zstd compression failed: "} +
+                                     ZSTD_getErrorName(remaining));
+        }
+        if (end ? remaining == 0 : in.pos == in.size) {
+            break;
+        }
+    }
+    setp(input.data(), input.data() + input.size());
+}
+
+ZSTDDecompressingBuffer::ZSTDDecompressingBuffer(std::span<const u8> compressed)
+    : context{ZSTD_createDCtx()}, source{compressed}, window(ZSTD_DStreamOutSize()) {
+    setg(window.data(), window.data(), window.data());
+}
+
+ZSTDDecompressingBuffer::~ZSTDDecompressingBuffer() {
+    ZSTD_freeDCtx(static_cast<ZSTD_DCtx*>(context));
+}
+
+ZSTDDecompressingBuffer::int_type ZSTDDecompressingBuffer::underflow() {
+    if (gptr() < egptr()) {
+        return traits_type::to_int_type(*gptr());
+    }
+    ZSTD_inBuffer in{source.data(), source.size(), position};
+    ZSTD_outBuffer out{window.data(), window.size(), 0};
+    // zstd may hold decompressed data back after consuming all input, so call
+    // it at least once per refill even when no input is left.
+    for (;;) {
+        const std::size_t result =
+            ZSTD_decompressStream(static_cast<ZSTD_DCtx*>(context), &out, &in);
+        if (ZSTD_isError(result)) {
+            throw std::runtime_error(std::string{"zstd decompression failed: "} +
+                                     ZSTD_getErrorName(result));
+        }
+        if (out.pos > 0 || in.pos == in.size) {
+            break;
+        }
+    }
+    position = in.pos;
+    if (out.pos == 0) {
+        return traits_type::eof();
+    }
+    setg(window.data(), window.data(), window.data() + out.pos);
+    return traits_type::to_int_type(*gptr());
 }
 
 std::vector<u8> CompressDataZSTDDefault(std::span<const u8> source) {

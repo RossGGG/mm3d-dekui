@@ -13,6 +13,7 @@
 #include <boost/serialization/export.hpp>
 #include <boost/serialization/shared_ptr.hpp>
 #include <boost/serialization/string.hpp>
+#include "common/file_util.h"
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "core/file_sys/romfs_reader.h"
@@ -142,8 +143,8 @@ private:
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::base_object<RomFSReader>(*this);
         ar & romfs;
-        ar & patch_path;
-        ar & patch_ext_path;
+        ar& FileUtil::Path::make(patch_path); // Host path, stored portably.
+        ar& FileUtil::Path::make(patch_ext_path); // Host path, stored portably.
         ar & load_relocations;
         if (Archive::is_loading::value) {
             Load();

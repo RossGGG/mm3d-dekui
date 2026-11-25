@@ -23,6 +23,7 @@
 #include "core/arm/dyncom/arm_dyncom.h"
 #include "core/cheats/cheats.h"
 #include "core/core.h"
+#include "core/jit_policy.h"
 #include "core/core_timing.h"
 #include "core/dumping/backend.h"
 #include "core/file_sys/ncch_container.h"
@@ -57,6 +58,13 @@
 #include "video_core/custom_textures/custom_tex_manager.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
+#ifdef CITRA_VISIONOS
+#include <cstdio>
+#include <oaknut/apple_jit26.hpp>
+#endif
+#if (defined(CITRA_VISIONOS) || defined(CITRA_TVOS)) && defined(ENABLE_MM3D_PRESENTATION)
+#include "mm3d/cpu_interpolation.h"
+#endif
 
 namespace Core {
 
@@ -102,11 +110,13 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
 
     Signal signal{Signal::None};
     u32 param{};
+    std::string path;
     {
         std::scoped_lock lock{signal_mutex};
         if (current_signal != Signal::None) {
             signal = current_signal;
             param = signal_param;
+            path = std::move(signal_path);
             current_signal = Signal::None;
         }
     }
@@ -142,8 +152,22 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             return ResultStatus::ErrorSavestateBuildMismatch;
         }
         save_state_slot = param;
+        save_state_path.clear();
         save_state_request_time = std::chrono::steady_clock::now();
         save_state_request_status = SaveStateStatus::LOADING;
+        break;
+    }
+    case Signal::LoadFile:
+    case Signal::SaveFile: {
+        if (save_state_request_status != SaveStateStatus::NONE) {
+            LOG_ERROR(Core, "A pending save state operation has not finished yet");
+            status_details = "A pending save state operation has not finished yet";
+            return ResultStatus::ErrorSavestate;
+        }
+        save_state_path = std::move(path);
+        save_state_request_time = std::chrono::steady_clock::now();
+        save_state_request_status =
+            signal == Signal::LoadFile ? SaveStateStatus::LOADING : SaveStateStatus::SAVING;
         break;
     }
     case Signal::Save: {
@@ -153,6 +177,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             return ResultStatus::ErrorSavestate;
         }
         save_state_slot = param;
+        save_state_path.clear();
         save_state_request_time = std::chrono::steady_clock::now();
         save_state_request_status = SaveStateStatus::SAVING;
         break;
@@ -165,9 +190,13 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         !kernel->AreAsyncOperationsPending()) {
         const u32 slot = save_state_slot;
         save_state_request_status = SaveStateStatus::NONE;
-        LOG_INFO(Core, "Begin load of slot {}", slot);
+        const std::string file = std::exchange(save_state_path, {});
+        LOG_INFO(Core, "Begin load of {}", file.empty() ? fmt::format("slot {}", slot) : file);
         try {
-            System::LoadState(slot);
+            if (file.empty())
+                System::LoadState(slot);
+            else
+                System::LoadStateFromFile(file);
             LOG_INFO(Core, "Load completed");
         } catch (const std::exception& e) {
             LOG_ERROR(Core, "Error loading: {}", e.what());
@@ -180,9 +209,13 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                !kernel->AreAsyncOperationsPending()) {
         save_state_request_status = SaveStateStatus::NONE;
         const u32 slot = save_state_slot;
-        LOG_INFO(Core, "Begin save to slot {}", slot);
+        const std::string file = std::exchange(save_state_path, {});
+        LOG_INFO(Core, "Begin save to {}", file.empty() ? fmt::format("slot {}", slot) : file);
         try {
-            System::SaveState(slot);
+            if (file.empty())
+                System::SaveState(slot);
+            else
+                System::SaveStateToFile(file);
             LOG_INFO(Core, "Save completed");
         } catch (const std::exception& e) {
             LOG_ERROR(Core, "Error saving: {}", e.what());
@@ -289,6 +322,18 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     return status;
 }
 
+bool System::SendFileSignal(System::Signal signal, std::string path) {
+    std::scoped_lock lock{signal_mutex};
+    if (current_signal != signal && current_signal != Signal::None) {
+        LOG_ERROR(Core, "Unable to {} as {} is ongoing", signal, current_signal);
+        return false;
+    }
+    current_signal = signal;
+    signal_param = 0;
+    signal_path = std::move(path);
+    return true;
+}
+
 bool System::SendSignal(System::Signal signal, u32 param) {
     std::scoped_lock lock{signal_mutex};
     if (current_signal != signal && current_signal != Signal::None) {
@@ -297,6 +342,7 @@ bool System::SendSignal(System::Signal signal, u32 param) {
     }
     current_signal = signal;
     signal_param = param;
+    signal_path.clear();
     return true;
 }
 
@@ -521,6 +567,43 @@ void System::Reschedule() {
 System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
                                   Frontend::EmuWindow* secondary_window,
                                   Kernel::MemoryMode memory_mode, u32 num_cores) {
+#ifdef CITRA_VISIONOS
+    // visionOS only executes memory that an attached debugger prepared (see
+    // oaknut/apple_jit26.hpp). Without a JIT enabler, fall back to the CPU and
+    // shader interpreters.
+#if defined(OAKNUT_APPLE_JIT26)
+    oaknut::apple_jit26::initialize();
+    const bool jit_ready = oaknut::apple_jit26::is_ready();
+#else
+    const bool jit_ready = false;
+#endif
+    // The player can keep the JIT off even with an enabler attached, to run
+    // the ahead-of-time code instead.
+    const bool jit_available = jit_ready && JitPolicy::allowed.load();
+    // The Qt config persists these, so a session without a debugger would
+    // otherwise leave the JIT disabled for every later session.
+    Settings::values.use_cpu_jit = jit_available;
+    Settings::values.use_shader_jit = jit_available;
+    if (!jit_ready) {
+        LOG_WARNING(Core, "JIT unavailable; launch through a JIT26 enabler to enable it");
+    } else if (!jit_available) {
+        LOG_INFO(Core, "JIT available but turned off in Settings");
+    }
+#ifdef ENABLE_MM3D_PRESENTATION
+    MM3D::CpuInterpolation::cpu_vertices_supported = jit_available;
+#endif
+    std::fprintf(stderr, "[JIT26] CPU backend: %s\n",
+                 jit_available ? "Dynarmic JIT" : "DynCom interpreter");
+#elif defined(CITRA_TVOS)
+    // tvOS never grants executable memory: always use the CPU and shader
+    // interpreters (the CPU interpreter runs ahead-of-time code when linked).
+    Settings::values.use_cpu_jit = false;
+    Settings::values.use_shader_jit = false;
+#ifdef ENABLE_MM3D_PRESENTATION
+    MM3D::CpuInterpolation::cpu_vertices_supported = false;
+#endif
+#endif
+
     // Notification for system initialization (either boot or savestate).
     if (on_init_callback) {
         on_init_callback(true);
