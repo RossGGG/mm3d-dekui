@@ -31,6 +31,44 @@ A custom fork of Azahar is used as the backing engine.
 - French and Spanish support with translations for custom button prompts and new dialogue
 - Many other minor changes in camera and HUD elements
 
+## About this fork: Apple Vision Pro and Apple TV
+
+This fork of DekUI adds native Apple Vision Pro (visionOS) and Apple TV (tvOS) apps
+alongside the existing desktop build. The major changes:
+
+- **Native SwiftUI apps for visionOS and tvOS.** `src/dekui_frontend` is a Qt-free
+  emulator front end, and `src/dekui_visionos` holds the SwiftUI apps built on it:
+  a game window, an Immersive View with per-eye stereo 3D, wide-screen HUD modes,
+  head tracking, controller and motion input, the software keyboard, settings and
+  setup. The Apple TV target adds its own menu, controls and Top Shelf icons.
+  See [docs/visionos-swiftui.md](docs/visionos-swiftui.md) and [docs/tvos.md](docs/tvos.md).
+- **Ahead-of-time (AOT) translation of game code.** Apple TV and Vision Pro apps
+  can't JIT-compile without a debugger attached. The AOT pipeline (`src/dekui_aot`,
+  `src/core/arm/aot`, `tools/aot`) translates the game's ARM code ahead of time and
+  falls back to the interpreter for anything it hasn't covered. A JIT policy picks
+  JIT, AOT or interpreter per platform. See [docs/aot.md](docs/aot.md).
+- **Optional JIT on Vision Pro.** When a debugger grants JIT (for example StikDebug),
+  patched dynarmic and oaknut write code through a separate alias, as TXM-enforced
+  devices require. The submodule changes live as patches in `tools/visionos/`,
+  which CMake applies at configure time.
+- **Save states that sync across devices.** Save states are compressed with zstd,
+  store host paths portably, and sync through iCloud Drive, so one state works on
+  Mac, Vision Pro and Apple TV. The Qt build gets a matching save-state menu.
+- **Vulkan renderer work.** An external present path for the native apps, per-eye
+  stereo rendering, a portable shader disk cache, and MoltenVK and simulator
+  workarounds.
+- **Shader tour.** A Mac-driven walkthrough that builds the shader cache ahead of
+  time, so Vision Pro and Apple TV don't stutter compiling shaders on first sight.
+  See [docs/mm3d/shader-tour.md](docs/mm3d/shader-tour.md).
+- **Expanded cheats menu** under Game Options > Cheats, with a self-test.
+  See [docs/mm3d/cheats.md](docs/mm3d/cheats.md).
+- **Hitch tracing.** Frame-time diagnostics (guest sampler, HLE call timing, present
+  breakdown) and `tools/mm3d/hitch_summary.py` to read the traces.
+  See [docs/hitch-trace.md](docs/hitch-trace.md).
+
+Build instructions for the Apple targets are in [docs/visionos.md](docs/visionos.md)
+and [INSTALL.md](INSTALL.md).
+
 ## Screenshots
 
 <table>
