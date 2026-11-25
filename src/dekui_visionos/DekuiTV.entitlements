@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The emulator, the ahead-of-time code and texture packs need more than
+         the default per-app memory limit. -->
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+    <!-- Each Apple TV profile gets its own data container (game folder,
+         in-game saves, settings) and syncs save states with its own iCloud
+         account. -->
+    <key>com.apple.developer.user-management</key>
+    <array>
+        <string>runs-as-current-user</string>
+    </array>
+    <!-- Save states sync with the other Dekui apps through the same iCloud
+         Drive container (Dekui.entitlements). -->
+    <key>com.apple.developer.icloud-container-identifiers</key>
+    <array>
+        <string>iCloud.org.azahar-emu.azahar</string>
+    </array>
+    <key>com.apple.developer.icloud-services</key>
+    <array>
+        <string>CloudDocuments</string>
+        <string>CloudKit</string>
+    </array>
+    <key>com.apple.developer.ubiquity-container-identifiers</key>
+    <array>
+        <string>iCloud.org.azahar-emu.azahar</string>
+    </array>
+</dict>
+</plist>

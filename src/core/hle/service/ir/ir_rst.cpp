@@ -14,6 +14,9 @@
 #include "core/hle/service/hid/hid.h"
 #include "core/hle/service/ir/ir_rst.h"
 #include "core/movie.h"
+#if defined(ENABLE_MM3D_PRESENTATION) && (defined(CITRA_TVOS) || defined(CITRA_VISIONOS))
+#include "mm3d/diagnostics.h"
+#endif
 
 SERIALIZE_EXPORT_IMPL(Service::IR::IR_RST)
 SERVICE_CONSTRUCT_IMPL(Service::IR::IR_RST)
@@ -109,6 +112,13 @@ void IR_RST::UpdateCallback(std::uintptr_t user_data, s64 cycles_late) {
             state.c_stick_right.Assign(direction.right);
         }
     }
+
+#if defined(ENABLE_MM3D_PRESENTATION) && (defined(CITRA_TVOS) || defined(CITRA_VISIONOS))
+    if (MM3D::overlay_visible.load()) {
+        state.hex = 0;
+        c_stick_x = c_stick_y = 0;
+    }
+#endif
 
     // TODO (wwylele): implement raw C-stick data for raw_c_stick = true
 

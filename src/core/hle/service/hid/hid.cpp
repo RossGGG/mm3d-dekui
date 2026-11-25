@@ -27,7 +27,13 @@
 #ifdef ENABLE_MM3D_PRESENTATION
 #include "mm3d/input_latency.h"
 #include "mm3d/classic_saving.h"
+#if defined(CITRA_TVOS) || defined(CITRA_VISIONOS)
+#include "mm3d/diagnostics.h"
+#endif
 #include "mm3d/ocarina_input.h"
+#include "mm3d/shader_tour.h"
+#include "mm3d/simple_cheats.h"
+#include "core/cheats/cheats.h"
 #endif
 
 SERVICE_CONSTRUCT_IMPL(Service::HID::Module)
@@ -128,6 +134,20 @@ void Module::LoadInputDevices() {
                    buttons.begin(), Input::CreateDevice<Input::ButtonDevice>);
     circle_pad = Input::CreateDevice<Input::AnalogDevice>(
         Settings::values.current_input_profile.analogs[Settings::NativeAnalog::CirclePad]);
+#ifdef ENABLE_MM3D_PRESENTATION
+    state_shortcut_modifier = Input::CreateDevice<Input::ButtonDevice>(
+        Settings::values.current_input_profile.buttons[Settings::NativeButton::ZR]);
+#endif
+#ifdef ENABLE_MM3D_PRESENTATION
+    // Dekui frontends register "dekui_motion" (dekui_frontend/motion.h) to
+    // apply the motion source setting; it wraps the profile's device.
+    if (Input::Impl::FactoryList<Input::MotionDevice>::list.contains("dekui_motion")) {
+        motion_device = Input::CreateDevice<Input::MotionDevice>(
+            Common::ParamPackage{{"engine", "dekui_motion"},
+                                 {"profile", Settings::values.current_input_profile.motion_device}}
+                .Serialize());
+    } else
+#endif
     motion_device = Input::CreateDevice<Input::MotionDevice>(
         Settings::values.current_input_profile.motion_device);
     touch_device = Input::CreateDevice<Input::TouchDevice>(
@@ -264,6 +284,22 @@ void Module::UpdatePadCallback(std::uintptr_t user_data, s64 cycles_late) {
 #ifdef ENABLE_MM3D_PRESENTATION
         MM3D::OcarinaInput::Filter(state.hex);
         MM3D::ClassicSaving::FilterArrivalPad(state.hex,circle_pad_x,circle_pad_y);
+        MM3D::ShaderTour::FilterPad(state.hex,circle_pad_x,circle_pad_y);
+        if (MM3D::SimpleCheats::FilterPad(state.hex))
+            system.CheatEngine().ApplyMoonJump();
+        // ZR + D-Pad Down / Up save and load states (Dekui::Poller); the game
+        // must not also act on those D-Pad presses.
+        if (state_shortcut_modifier && state_shortcut_modifier->GetStatus()) {
+            state.up.Assign(0);
+            state.down.Assign(0);
+        }
+#if defined(CITRA_TVOS) || defined(CITRA_VISIONOS)
+        // Game Options owns controller input while open on Apple frontends.
+        if (MM3D::overlay_visible.load()) {
+            state.hex = 0;
+            circle_pad_x = circle_pad_y = 0;
+        }
+#endif
 #endif
 
         const DirectionState direction = GetStickDirectionState(circle_pad_x, circle_pad_y);
@@ -347,9 +383,8 @@ void Module::UpdatePadCallback(std::uintptr_t user_data, s64 cycles_late) {
 
     // TODO(xperia64): How the 3D Slider is updated by the HID module needs to be RE'd
     // and possibly moved to its own Core::Timing event.
-    mem->pad.sliderstate_3d = (Settings::values.factor_3d.GetValue() / 100.0f);
-    system.Kernel().GetSharedPageHandler().Set3DSlider(Settings::values.factor_3d.GetValue() /
-                                                       100.0f);
+    mem->pad.sliderstate_3d = Settings::Effective3DSlider();
+    system.Kernel().GetSharedPageHandler().Set3DSlider(Settings::Effective3DSlider());
 
     // Reschedule recurrent event
     system.CoreTiming().ScheduleEvent(pad_update_ticks - cycles_late, pad_update_event);

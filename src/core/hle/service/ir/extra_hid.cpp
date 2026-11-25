@@ -9,6 +9,9 @@
 #include "core/hle/service/hid/hid.h"
 #include "core/hle/service/ir/extra_hid.h"
 #include "core/movie.h"
+#if defined(ENABLE_MM3D_PRESENTATION) && (defined(CITRA_TVOS) || defined(CITRA_VISIONOS))
+#include "mm3d/diagnostics.h"
+#endif
 
 namespace Service::IR {
 
@@ -274,6 +277,16 @@ void ExtraHID::SendHIDStatus() {
     }
 
     movie.HandleExtraHidResponse(response);
+
+#if defined(ENABLE_MM3D_PRESENTATION) && (defined(CITRA_TVOS) || defined(CITRA_VISIONOS))
+    // Match the main HID service: the host menu owns the controller while open.
+    if (MM3D::overlay_visible.load()) {
+        response.c_stick.c_stick_x.Assign(C_STICK_CENTER);
+        response.c_stick.c_stick_y.Assign(C_STICK_CENTER);
+        response.buttons.zl_not_held.Assign(1);
+        response.buttons.zr_not_held.Assign(1);
+    }
+#endif
 
     std::vector<u8> response_buffer(sizeof(response));
     memcpy(response_buffer.data(), &response, sizeof(response));

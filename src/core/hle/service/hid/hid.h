@@ -389,6 +389,11 @@ private:
     std::array<std::unique_ptr<Input::ButtonDevice>, Settings::NativeButton::NUM_BUTTONS_HID>
         buttons;
     std::unique_ptr<Input::AnalogDevice> circle_pad;
+#ifdef ENABLE_MM3D_PRESENTATION
+    /// ZR (otherwise read by ir:rst): while held, D-Pad Up/Down belong to the
+    /// save state shortcuts and are kept from the game.
+    std::unique_ptr<Input::ButtonDevice> state_shortcut_modifier;
+#endif
     std::unique_ptr<Input::MotionDevice> motion_device;
     std::unique_ptr<Input::TouchDevice> controller_touch_device;
     std::unique_ptr<Input::TouchDevice> touch_device;
