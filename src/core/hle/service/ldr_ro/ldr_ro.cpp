@@ -12,6 +12,7 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/ldr_ro/cro_helper.h"
 #include "core/hle/service/ldr_ro/ldr_ro.h"
+#include "core/arm/aot_coverage.h"
 
 SERVICE_CONSTRUCT_IMPL(Service::LDR::RO)
 SERIALIZE_EXPORT_IMPL(Service::LDR::RO)
@@ -189,6 +190,9 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
               link_on_load_bug_fix ? "new" : "old", cro_buffer_ptr, cro_address, cro_size,
               data_segment_address, zero, data_segment_size, bss_segment_address, bss_segment_size,
               auto_link ? "true" : "false", fix_level, crr_address);
+
+    Core::AotCoverage::RecordCroLoad(cro_address, cro_size, data_segment_address,
+                                     data_segment_size);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
 

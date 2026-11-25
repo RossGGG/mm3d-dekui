@@ -60,9 +60,16 @@ protected:
 
 private:
     void ExecuteInstructions(u64 num_instructions);
+    void ClearTranslations();
 
     Core::System& system;
     std::unique_ptr<ARMul_State> state;
+#ifdef ENABLE_MM3D_PRESENTATION
+    struct MM3DHookState;
+    std::unique_ptr<MM3DHookState> mm3d;
+#endif
+    struct AotState;
+    std::unique_ptr<AotState> aot;
 };
 
 } // namespace Core

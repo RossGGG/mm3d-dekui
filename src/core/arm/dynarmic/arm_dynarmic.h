@@ -5,6 +5,7 @@
 #pragma once
 
 #include <map>
+#include <vector>
 #include <memory>
 #include <dynarmic/interface/A32/a32.h>
 #include "common/common_types.h"
@@ -84,6 +85,15 @@ private:
     Dynarmic::A32::Jit* jit = nullptr;
     std::shared_ptr<Memory::PageTable> current_page_table = nullptr;
     std::map<std::shared_ptr<Memory::PageTable>, std::unique_ptr<Dynarmic::A32::Jit>> jits;
+
+#ifdef CITRA_VISIONOS
+    // visionOS JIT code comes from a fixed, debugger-prepared arena, so each
+    // core keeps only the JIT for its current page table. A JIT replaced while
+    // it is executing (page-table switch inside an SVC) is freed on the next Run.
+    void RetireOtherJits();
+    bool running = false;
+    std::vector<std::unique_ptr<Dynarmic::A32::Jit>> retired_jits;
+#endif
 };
 
 } // namespace Core

@@ -22,7 +22,7 @@
 #pragma once
 
 #include <array>
-#include <unordered_map>
+#include <tsl/robin_map.h>
 #include "common/common_types.h"
 #include "core/arm/skyeye_common/arm_regformat.h"
 #ifdef ENABLE_GDBSTUB
@@ -30,6 +30,10 @@
 #endif
 
 namespace Core {
+class MM3DGuestHooks;
+namespace Aot {
+class Runner;
+}
 class System;
 }
 
@@ -181,6 +185,9 @@ public:
         exclusive_tag = address & RESERVATION_GRANULE_MASK;
         exclusive_state = true;
     }
+    bool HasExclusiveAccess() const {
+        return exclusive_state;
+    }
     void UnsetExclusiveMemoryAddress() {
         exclusive_tag = 0xFFFFFFFF;
         exclusive_state = false;
@@ -216,6 +223,10 @@ public:
 
     Core::System& system;
     Memory::MemorySystem& memory;
+    // MM3D enhancement hooks shared with the Dynarmic backend; null when disabled.
+    Core::MM3DGuestHooks* mm3d_hooks = nullptr;
+    // Ahead-of-time translated guest code; null when the build has none.
+    Core::Aot::Runner* aot_runner = nullptr;
 
     std::array<u32, 16> Reg{}; // The current register file
     std::array<u32, 2> Reg_usr{};
@@ -262,7 +273,8 @@ public:
 
     // TODO(bunnei): Move this cache to a better place - it should be per codeset (likely per
     // process for our purposes), not per ARMul_State (which tracks CPU core state).
-    std::unordered_map<u32, std::size_t> instruction_cache;
+    // Looked up on every interpreted block entry; open addressing keeps it cheap.
+    tsl::robin_map<u32, std::size_t> instruction_cache;
 
 private:
     void ResetMPCoreCP15Registers();

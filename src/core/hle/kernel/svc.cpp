@@ -44,6 +44,9 @@
 #include "core/hle/kernel/wait_object.h"
 #include "core/hle/result.h"
 #include "core/hle/service/plgldr/plgldr.h"
+#include "common/hitch_trace.h"
+#include "core/arm/aot/runtime.h"
+#include "core/arm/aot_coverage.h"
 
 namespace Kernel {
 
@@ -2055,6 +2058,8 @@ Result SVC::GetProcessList(s32* process_count, VAddr out_process_array,
 }
 
 Result SVC::InvalidateInstructionCacheRange(u32 addr, u32 size) {
+    Core::AotCoverage::RecordInvalidate(addr, size);
+    Core::Aot::Invalidate(addr, size);
     for (size_t i = 0; i < system.GetNumCores(); i++) {
         system.GetCore(i).InvalidateCacheRange(addr, size);
     }
@@ -2062,6 +2067,8 @@ Result SVC::InvalidateInstructionCacheRange(u32 addr, u32 size) {
 }
 
 Result SVC::InvalidateEntireInstructionCache() {
+    Core::AotCoverage::RecordInvalidateAll();
+    Core::Aot::InvalidateAll();
     for (size_t i = 0; i < system.GetNumCores(); i++) {
         system.GetCore(i).ClearInstructionCache();
     }
@@ -2438,6 +2445,7 @@ void SVC::CallSVC(u32 immediate) {
                      "Running threads from exiting processes is unimplemented");
 
     const FunctionDef* info = GetSVCInfo(immediate);
+    const Common::HitchTrace::CallScope hitch_call{"svc", info ? info->name : nullptr, immediate};
     LOG_TRACE(Kernel_SVC, "calling {}", info->name);
     if (info) {
         if (info->func) {

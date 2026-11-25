@@ -11,12 +11,15 @@
 #include <algorithm>
 #include <cstdio>
 #include "common/common_types.h"
+#include "common/hitch_trace.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "core/arm/dyncom/arm_dyncom_dec.h"
 #include "core/arm/dyncom/arm_dyncom_interpreter.h"
 #include "core/arm/dyncom/arm_dyncom_run.h"
 #include "core/arm/dyncom/arm_dyncom_thumb.h"
+#include "core/arm/aot/runtime.h"
+#include "core/arm/aot_coverage.h"
 #include "core/arm/dyncom/arm_dyncom_trans.h"
 #include "core/arm/skyeye_common/armstate.h"
 #include "core/arm/skyeye_common/armsupp.h"
@@ -28,6 +31,9 @@
 #endif
 #include "core/hle/kernel/svc.h"
 #include "core/memory.h"
+#ifdef ENABLE_MM3D_PRESENTATION
+#include "core/arm/mm3d_guest_hooks.h"
+#endif
 
 #define RM BITS(sht_oper, 0, 3)
 #define RS BITS(sht_oper, 8, 11)
@@ -817,6 +823,13 @@ static unsigned int InterpreterTranslateInstruction(const ARMul_State* cpu, cons
                                                     ARM_INST_PTR& inst_base) {
     u32 inst_size = 4;
     u32 inst = cpu->memory.Read32(phys_addr & 0xFFFFFFFC);
+#ifdef ENABLE_MM3D_PRESENTATION
+    // Apply MM3D code substitutions, matching Dynarmic's MemoryReadCode.
+    if (!cpu->TFlag && cpu->mm3d_hooks) {
+        if (const auto patched = cpu->mm3d_hooks->ReadCode(phys_addr & 0xFFFFFFFC))
+            inst = *patched;
+    }
+#endif
 
     // If we are in Thumb mode, we'll translate one Thumb instruction to the corresponding ARM
     // instruction
@@ -860,6 +873,9 @@ static int InterpreterTranslateBlock(ARMul_State* cpu, std::size_t& bb_start, u3
     u32 pc_start = cpu->Reg[15];
 
     while (ret == TransExtData::NON_BRANCH) {
+        Core::AotCoverage::RecordInstruction(
+            cpu->TFlag, phys_addr,
+            Core::AotCoverage::BlockDescriptor(addr, cpu->Cpsr, cpu->VFP[VFP_FPSCR]));
         u32 inst_size = InterpreterTranslateInstruction(cpu, phys_addr, inst_base);
         phys_addr += inst_size;
 
@@ -1644,6 +1660,26 @@ DISPATCH: {
         cpu->Reg[15] &= 0xfffffffe;
     else
         cpu->Reg[15] &= 0xfffffffc;
+
+    // Prefer ahead-of-time translated code for this block when the build has it.
+    if (cpu->aot_runner && cpu->NumInstrsToExecute > 1) {
+        SAVE_NZCVT;
+        const u64 descriptor =
+            Core::AotCoverage::BlockDescriptor(cpu->Reg[15], cpu->Cpsr, cpu->VFP[VFP_FPSCR]);
+        if (Core::Aot::Lookup(descriptor)) {
+            cpu->system.GetRunningCore().GetTimer().AddTicks(num_instrs);
+            cpu->NumInstrsToExecute =
+                num_instrs >= cpu->NumInstrsToExecute ? 0 : cpu->NumInstrsToExecute - num_instrs;
+            num_instrs = 0;
+            if (cpu->NumInstrsToExecute == 0)
+                goto END;
+            cpu->aot_runner->Run(descriptor, *cpu->memory.GetCurrentPageTable());
+            LOAD_NZCVT;
+            if (cpu->NumInstrsToExecute == 0)
+                goto END;
+            goto DISPATCH;
+        }
+    }
 
     // Find the cached instruction cream, otherwise translate it...
     auto itr = cpu->instruction_cache.find(cpu->Reg[15]);
@@ -3875,6 +3911,23 @@ SWI_INST: {
         cpu->NumInstrsToExecute =
             num_instrs >= cpu->NumInstrsToExecute ? 0 : cpu->NumInstrsToExecute - num_instrs;
         num_instrs = 0;
+#ifdef ENABLE_MM3D_PRESENTATION
+        if (cpu->mm3d_hooks && !cpu->TFlag) {
+            // MM3D hooks expect Dynarmic's SVC state: R15 at the next
+            // instruction and the flags in CPSR. They may redirect R15.
+            const u32 svc_pc = cpu->Reg[15];
+            cpu->Reg[15] = svc_pc + 4;
+            SAVE_NZCVT;
+            const auto hook_start = std::chrono::steady_clock::now();
+            if (cpu->mm3d_hooks->CallSVC(inst_cream->num)) {
+                Common::HitchTrace::AddCall("hook", nullptr, inst_cream->num,
+                                            std::chrono::steady_clock::now() - hook_start);
+                LOAD_NZCVT;
+                goto DISPATCH;
+            }
+            cpu->Reg[15] = svc_pc;
+        }
+#endif
         Kernel::SVCContext{cpu->system}.CallSVC(inst_cream->num & 0xFFFF);
         // The kernel would call ERET to get here, which clears exclusive memory state.
         cpu->UnsetExclusiveMemoryAddress();

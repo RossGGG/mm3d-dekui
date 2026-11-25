@@ -25,6 +25,7 @@
 #include "core/hle/service/fs/archive.h"
 #include "core/hle/service/fs/fs_user.h"
 #include "core/hw/unique_data.h"
+#include "core/arm/aot/runtime.h"
 #include "core/loader/ncch.h"
 #include "core/loader/smdh.h"
 #include "core/memory.h"
@@ -169,6 +170,7 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
             return patch_result;
 
         codeset->entrypoint = codeset->CodeSegment().addr;
+        Core::Aot::OnCodeLoaded(program_id, code);
         codeset->memory = std::move(code);
 
         process = system.Kernel().CreateProcess(std::move(codeset));

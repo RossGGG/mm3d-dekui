@@ -1,5 +1,11 @@
 add_library(citra_core STATIC EXCLUDE_FROM_ALL
     3ds.h
+    arm/aot/abi.h
+    arm/aot/block_support.h
+    arm/aot/runtime.cpp
+    arm/aot/runtime.h
+    arm/aot_coverage.cpp
+    arm/aot_coverage.h
     arm/arm_interface.h
     arm/exception_handler.cpp
     arm/exception_handler.h
@@ -16,6 +22,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     arm/dyncom/arm_dyncom_trans.h
     arm/exclusive_monitor.cpp
     arm/exclusive_monitor.h
+    arm/mm3d_guest_hooks.cpp
+    arm/mm3d_guest_hooks.h
     arm/skyeye_common/arm_regformat.h
     arm/skyeye_common/armstate.cpp
     arm/skyeye_common/armstate.h
@@ -501,7 +509,7 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
 create_target_directory_groups(citra_core)
 
 target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core)
-target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib)
+target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib tsl::robin_map)
 target_link_libraries(citra_core PUBLIC dds-ktx PRIVATE cryptopp fmt lodepng open_source_archives)
 
 if (ENABLE_WEB_SERVICE)
@@ -543,9 +551,49 @@ if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
         arm/dynarmic/arm_tick_counts.cpp
         arm/dynarmic/arm_tick_counts.h
     )
-    target_link_libraries(citra_core PRIVATE dynarmic)
+    # merry::mcl: AOT coverage reads the block descriptor from Dynarmic's IR emitter.
+    target_link_libraries(citra_core PRIVATE dynarmic merry::mcl)
 endif()
 
 if (CITRA_USE_PRECOMPILED_HEADERS)
     target_precompile_headers(citra_core PRIVATE precompiled_headers.h)
+endif()
+
+# Ahead-of-time translated MM3D code, generated from the user's own dump by
+# tools/aot/build_aot.sh. AArch64 hosts only; without it the runtime is inert.
+set(DEKUI_AOT_GENERATED_DIR "" CACHE PATH "Directory written by 'dekui_aot emit'")
+if (DEKUI_AOT_GENERATED_DIR)
+    if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        message(FATAL_ERROR "DEKUI_AOT_GENERATED_DIR needs an AArch64 target")
+    endif()
+    include("${DEKUI_AOT_GENERATED_DIR}/sources.cmake")
+    add_library(dekui_aot_generated STATIC ${DEKUI_AOT_GENERATED_SOURCES})
+    target_include_directories(dekui_aot_generated PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    if (CITRA_TVOS)
+        set(_DEKUI_AOT_DEFAULT_OPTIMIZATION "-O3")
+    else()
+        set(_DEKUI_AOT_DEFAULT_OPTIMIZATION "-O2")
+    endif()
+    set(DEKUI_AOT_OPTIMIZATION "${_DEKUI_AOT_DEFAULT_OPTIMIZATION}" CACHE STRING
+        "Compiler optimization flag for generated AOT guest code")
+    # Generated code is large and machine-written; skip the project's warnings.
+    # Xcode owns the optimization flag through GCC_OPTIMIZATION_LEVEL. Adding an
+    # explicit -O flag here can be concatenated with an adjacent compiler option
+    # in its generated response file.
+    if (CMAKE_GENERATOR STREQUAL "Xcode")
+        if (NOT DEKUI_AOT_OPTIMIZATION MATCHES "^-O[0-3s]$")
+            message(FATAL_ERROR
+                "Xcode AOT optimization must be one of -O0, -O1, -O2, -O3, or -Os")
+        endif()
+        string(SUBSTRING "${DEKUI_AOT_OPTIMIZATION}" 2 -1 _DEKUI_AOT_XCODE_LEVEL)
+        set_target_properties(dekui_aot_generated PROPERTIES
+            XCODE_ATTRIBUTE_GCC_OPTIMIZATION_LEVEL "${_DEKUI_AOT_XCODE_LEVEL}")
+        target_compile_options(dekui_aot_generated PRIVATE -w -fno-exceptions)
+    else()
+        target_compile_options(dekui_aot_generated PRIVATE
+            "${DEKUI_AOT_OPTIMIZATION}" -w -fno-exceptions)
+    endif()
+    message(STATUS "Generated AOT optimization: ${DEKUI_AOT_OPTIMIZATION}")
+    target_compile_definitions(citra_core PRIVATE DEKUI_AOT_LINKED)
+    target_link_libraries(citra_core PRIVATE dekui_aot_generated)
 endif()
