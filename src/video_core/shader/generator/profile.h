@@ -43,6 +43,10 @@ struct Profile {
 
     u8 vk_disable_spirv_optimizer{};
     u8 vk_use_spirv_generator{};
+    // PICA depth mapping is done per vertex (depth clamp + a far clip plane),
+    // so fragment shaders need not write depth. Occupies padding before
+    // vk_format_traits: the disk cache stores this struct by size.
+    u8 vk_vertex_depth{};
     std::array<VKFormatTraits, 16> vk_format_traits{};
 
     u8 is_vulkan{};

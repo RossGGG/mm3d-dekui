@@ -171,6 +171,17 @@ void RasterizerAccelerated::SyncDrawUniforms() {
         fs_data.depth_scale = f24::FromRaw(regs.rasterizer.viewport_depth_range).ToFloat32();
         fs_data.depth_offset = f24::FromRaw(regs.rasterizer.viewport_depth_near_plane).ToFloat32();
         fs_data_dirty = true;
+        vs_data.depth_scale = fs_data.depth_scale;
+        vs_data.depth_offset = fs_data.depth_offset;
+        vs_data_dirty = true;
+    }
+
+    // W-buffering divides by the fragment's w, so it keeps the per-fragment depth write.
+    const u32 vertex_depth = vertex_depth_supported && regs.rasterizer.depthmap_enable !=
+                                                          Pica::RasterizerRegs::DepthBuffering::WBuffering;
+    if (vs_data.vertex_depth != vertex_depth) {
+        vs_data.vertex_depth = vertex_depth;
+        vs_data_dirty = true;
     }
 
     // Sync alpha testing and blending uniforms

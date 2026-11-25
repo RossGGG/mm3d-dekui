@@ -88,6 +88,14 @@
 #ifndef IMGUI_DISABLE
 #include "imgui_impl_vulkan.h"
 #include <stdio.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_SIMULATOR
+// Dekui: Apple's simulator GPUs cannot draw indexed with a non-zero base
+// vertex. Bind each draw list's vertices at a buffer offset instead.
+#define IMGUI_IMPL_VULKAN_NO_BASE_VERTEX 1
+#endif
+#endif
 #ifndef IM_MAX
 #define IM_MAX(A, B)    (((A) >= (B)) ? (A) : (B))
 #endif
@@ -443,6 +451,15 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
     buffer_size = buffer_size_aligned;
 }
 
+// Dekui: horizontal framebuffer offset, so one frame's draw data can be drawn
+// into each eye of a side-by-side stereo framebuffer.
+static int g_ViewportOffsetX = 0;
+
+void ImGui_ImplVulkan_SetViewportOffsetX(int offset_x)
+{
+    g_ViewportOffsetX = offset_x;
+}
+
 static void ImGui_ImplVulkan_SetupRenderState(ImDrawData* draw_data, VkPipeline pipeline, VkCommandBuffer command_buffer, ImGui_ImplVulkan_FrameRenderBuffers* rb, int fb_width, int fb_height)
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
@@ -464,7 +481,7 @@ static void ImGui_ImplVulkan_SetupRenderState(ImDrawData* draw_data, VkPipeline 
     // Setup viewport:
     {
         VkViewport viewport;
-        viewport.x = 0;
+        viewport.x = (float)g_ViewportOffsetX;
         viewport.y = 0;
         viewport.width = (float)fb_width;
         viewport.height = (float)fb_height;
@@ -602,7 +619,7 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
 
                 // Apply scissor/clipping rectangle
                 VkRect2D scissor;
-                scissor.offset.x = (int32_t)(clip_min.x);
+                scissor.offset.x = (int32_t)(clip_min.x) + g_ViewportOffsetX;
                 scissor.offset.y = (int32_t)(clip_min.y);
                 scissor.extent.width = (uint32_t)(clip_max.x - clip_min.x);
                 scissor.extent.height = (uint32_t)(clip_max.y - clip_min.y);
@@ -613,7 +630,14 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
                 vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bd->PipelineLayout, 0, 1, &desc_set, 0, nullptr);
 
                 // Draw
+#ifdef IMGUI_IMPL_VULKAN_NO_BASE_VERTEX
+                VkBuffer vertex_buffer = rb->VertexBuffer;
+                VkDeviceSize vertex_offset = (VkDeviceSize)global_vtx_offset * sizeof(ImDrawVert);
+                vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffer, &vertex_offset);
+                vkCmdDrawIndexed(command_buffer, pcmd->ElemCount, 1, pcmd->IdxOffset + global_idx_offset, 0, 0);
+#else
                 vkCmdDrawIndexed(command_buffer, pcmd->ElemCount, 1, pcmd->IdxOffset + global_idx_offset, pcmd->VtxOffset + global_vtx_offset, 0);
+#endif
             }
         }
         global_idx_offset += draw_list->IdxBuffer.Size;
@@ -628,7 +652,7 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
     // If you use VK_DYNAMIC_STATE_VIEWPORT or VK_DYNAMIC_STATE_SCISSOR you are responsible for setting the values before rendering.
     // In theory we should aim to backup/restore those values but I am not sure this is possible.
     // We perform a call to vkCmdSetScissor() to set back a full viewport which is likely to fix things for 99% users but technically this is not perfect. (See github #4644)
-    VkRect2D scissor = { { 0, 0 }, { (uint32_t)fb_width, (uint32_t)fb_height } };
+    VkRect2D scissor = { { g_ViewportOffsetX, 0 }, { (uint32_t)fb_width, (uint32_t)fb_height } };
     vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 }
 
@@ -1158,7 +1182,9 @@ bool    ImGui_ImplVulkan_Init(ImGui_ImplVulkan_InitInfo* info)
     ImGui_ImplVulkan_Data* bd = IM_NEW(ImGui_ImplVulkan_Data)();
     io.BackendRendererUserData = (void*)bd;
     io.BackendRendererName = "imgui_impl_vulkan";
+#ifndef IMGUI_IMPL_VULKAN_NO_BASE_VERTEX
     io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;  // We can honor the ImDrawCmd::VtxOffset field, allowing for large meshes.
+#endif
 
     IM_ASSERT(info->Instance != VK_NULL_HANDLE);
     IM_ASSERT(info->PhysicalDevice != VK_NULL_HANDLE);

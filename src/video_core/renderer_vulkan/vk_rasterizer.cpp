@@ -1,3 +1,4 @@
+#include "mm3d/wide_view.h"
 #include "mm3d/effect_capture.h"
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
@@ -61,6 +62,12 @@ using namespace Pica::Shader::Generator;
 constexpr u64 STREAM_BUFFER_SIZE = 64_MiB;
 constexpr u64 UNIFORM_BUFFER_SIZE = 8_MiB;
 constexpr u64 TEXTURE_BUFFER_SIZE = 2_MiB;
+#ifdef CITRA_PRIVATE_TEXEL_BUFFERS
+constexpr vk::BufferUsageFlags TEXEL_BUFFER_USAGE =
+    vk::BufferUsageFlagBits::eUniformTexelBuffer | vk::BufferUsageFlagBits::eTransferSrc;
+#else
+constexpr vk::BufferUsageFlags TEXEL_BUFFER_USAGE = vk::BufferUsageFlagBits::eUniformTexelBuffer;
+#endif
 
 constexpr vk::BufferUsageFlags BUFFER_USAGE =
     vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndexBuffer;
@@ -96,11 +103,14 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
       stream_buffer{instance, scheduler, BUFFER_USAGE, STREAM_BUFFER_SIZE},
       uniform_buffer{instance, scheduler, vk::BufferUsageFlagBits::eUniformBuffer,
                      UNIFORM_BUFFER_SIZE},
-      texture_buffer{instance, scheduler, vk::BufferUsageFlagBits::eUniformTexelBuffer,
-                     TextureBufferSize(instance)},
-      texture_lf_buffer{instance, scheduler, vk::BufferUsageFlagBits::eUniformTexelBuffer,
-                        TextureBufferSize(instance)},
+      texture_buffer{instance, scheduler, TEXEL_BUFFER_USAGE, TextureBufferSize(instance)},
+      texture_lf_buffer{instance, scheduler, TEXEL_BUFFER_USAGE, TextureBufferSize(instance)},
+#ifdef CITRA_PRIVATE_TEXEL_BUFFERS
+      texture_private{instance, TextureBufferSize(instance)},
+      texture_lf_private{instance, TextureBufferSize(instance)},
+#endif
       async_shaders{Settings::values.async_shader_compilation.GetValue()} {
+    vertex_depth_supported = instance.UseVertexDepth();
 
 #ifdef ENABLE_MM3D_PRESENTATION
     ResetPause();
@@ -132,20 +142,27 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
     pipeline_info.state.vertex_layout = software_layout;
 
     const vk::Device device = instance.GetDevice();
+#ifdef CITRA_PRIVATE_TEXEL_BUFFERS
+    const vk::Buffer texel_buffer = texture_private.Handle();
+    const vk::Buffer texel_lf_buffer = texture_lf_private.Handle();
+#else
+    const vk::Buffer texel_buffer = texture_buffer.Handle();
+    const vk::Buffer texel_lf_buffer = texture_lf_buffer.Handle();
+#endif
     texture_lf_view = device.createBufferViewUnique({
-        .buffer = texture_lf_buffer.Handle(),
+        .buffer = texel_lf_buffer,
         .format = vk::Format::eR32G32Sfloat,
         .offset = 0,
         .range = VK_WHOLE_SIZE,
     });
     texture_rg_view = device.createBufferViewUnique({
-        .buffer = texture_buffer.Handle(),
+        .buffer = texel_buffer,
         .format = vk::Format::eR32G32Sfloat,
         .offset = 0,
         .range = VK_WHOLE_SIZE,
     });
     texture_rgba_view = device.createBufferViewUnique({
-        .buffer = texture_buffer.Handle(),
+        .buffer = texel_buffer,
         .format = vk::Format::eR32G32B32A32Sfloat,
         .offset = 0,
         .range = VK_WHOLE_SIZE,
@@ -189,6 +206,69 @@ RasterizerVulkan::~RasterizerVulkan() {
 #endif
 }
 
+#ifdef ENABLE_MM3D_PRESENTATION
+void RasterizerVulkan::SwapMidpointEye() {
+    auto& o=midpoint_other_eye;
+    using std::swap;
+    swap(midpoint_history,o.history);
+    swap(forest_particle_history,o.forest_particle_history);
+    swap(link_history,o.link_history);
+    swap(song_history,o.song_history);
+    swap(song_overrides,o.song_overrides);
+    swap(link_overrides,o.link_overrides);
+    swap(link_poses,o.link_poses);
+    swap(link_frame,o.link_frame);
+    swap(link_generation,o.link_generation);
+    swap(midpoint_generation,o.generation);
+    swap(midpoint_width,o.width);
+    swap(midpoint_height,o.height);
+    swap(midpoint_target_frame,o.target_frame);
+    swap(midpoint_fade_frame,o.fade_frame);
+    swap(midpoint_hud_frame,o.hud_frame);
+    swap(midpoint_title_depth_frame,o.title_depth_frame);
+    swap(midpoint_world_frame,o.world_frame);
+    swap(midpoint_opaque_world_frame,o.opaque_world_frame);
+    swap(midpoint_stencil_frame,o.stencil_frame);
+    swap(midpoint_hud_failed,o.hud_failed);
+    swap(midpoint_frame_interpolated,o.frame_interpolated);
+    swap(glare_history,o.glare_history);
+    swap(ripple_history,o.ripple_history);
+    swap(splash_history,o.splash_history);
+    swap(midpoint_scene_clear,o.scene_clear);
+    swap(midpoint_last_draw_ms,o.last_draw_ms);
+    // Same ids for both eyes, so draw classification and replay need no changes.
+    for(std::size_t i=0;i<MidpointLayerIds.size();++i) {
+        std::unique_ptr<MM3D::PromptLayer> active;
+        if(const auto it=prompt_layers.find(MidpointLayerIds[i]);it!=prompt_layers.end()) {
+            active=std::move(it->second);
+            prompt_layers.erase(it);
+        }
+        if(o.layers[i])prompt_layers[MidpointLayerIds[i]]=std::move(o.layers[i]);
+        o.layers[i]=std::move(active);
+    }
+}
+
+void RasterizerVulkan::SetMidpointEye(unsigned eye) {
+    if(eye==midpoint_eye)return;
+    SwapMidpointEye();
+    midpoint_eye=eye;
+}
+
+void RasterizerVulkan::ResetMidpointOtherEye() {
+    auto layers=std::move(midpoint_other_eye.layers);
+    midpoint_other_eye=MidpointEyeState{};
+    for(auto& layer : layers)if(layer)layer->NextFrame();
+    midpoint_other_eye.layers=std::move(layers);
+}
+
+const MM3D::PromptLayer* RasterizerVulkan::MidpointRightEyeLayer(std::string_view id) const {
+    if(!RightEyeCaptured())return nullptr;
+    for(std::size_t i=0;i<MidpointLayerIds.size();++i)
+        if(id==MidpointLayerIds[i])return midpoint_other_eye.layers[i].get();
+    return nullptr;
+}
+#endif
+
 void RasterizerVulkan::TickFrame() {
 #ifdef ENABLE_MM3D_PRESENTATION
     MM3D::Widescreen::corrected_draws.store(MM3D::Widescreen::frame_corrected_draws);
@@ -199,7 +279,12 @@ void RasterizerVulkan::TickFrame() {
     MM3D::CameraMidpoint::rejected_draws=midpoint_rejected;
     MM3D::CameraMidpoint::fallback_draws=midpoint_fallback;
     midpoint_copies=midpoint_rejected=midpoint_fallback=0;
-    if(!MM3D::CameraMidpoint::enabled.load())midpoint_history.Reset();
+    // Presentation happens between guest frames, with the left eye's state active.
+    SetMidpointEye(0);
+    if(!MM3D::CameraMidpoint::enabled.load()) {
+        midpoint_history.Reset();
+        midpoint_other_eye.history.Reset();
+    }
     MM3D::Minimap::NextFrame();
     MM3D::Profiles::CompleteDetectionFrame();
     const auto preview_now=std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -214,8 +299,24 @@ void RasterizerVulkan::TickFrame() {
             midpoint_target_frame.reset();
         }
     }
+    {
+        auto& other=midpoint_other_eye;
+        const bool stale=!MM3D::CameraMidpoint::enabled.load() ||
+            other.generation!=MM3D::CameraMidpoint::generation.load() ||
+            preview_now-other.last_draw_ms>200;
+        for(auto& layer : other.layers) {
+            if(layer && stale) {
+                layer->NextFrame();
+                other.target_frame.reset();
+            }
+        }
+    }
 #endif
     scheduler.WaitWorker();
+    if (TextureRuntime::RGBA8StorageRequested() && !TextureRuntime::RGBA8Storage()) {
+        TextureRuntime::EnableRGBA8Storage();
+        res_cache.RecreateAll();
+    }
     res_cache.TickFrame();
 }
 
@@ -326,6 +427,9 @@ void RasterizerVulkan::SetupVertexArray() {
     VertexLayout& layout = pipeline_info.state.vertex_layout;
     layout.binding_count = 0;
     layout.attribute_count = 16;
+    // Unused binding slots are hashed into the pipeline key, so clear what the
+    // previous draw left there; stale strides doubled the pipelines compiled.
+    layout.bindings = {};
     enable_attributes.fill(false);
 
     u32 buffer_offset = 0;
@@ -665,14 +769,20 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
         SetupIndexArray();
     }
 
-    const bool wait_built = !async_shaders || regs.pipeline.num_vertices <= 6;
+    // Skip draws whose pipeline is still compiling rather than stall the
+    // frame; Metal compiles take 100+ ms each. Small draws used to wait too.
+    const bool wait_built = !async_shaders;
     if (!pipeline_cache.BindPipeline(pipeline_info, wait_built)) {
         return true;
     }
 
     const DrawParams params = {
         .vertex_count = regs.pipeline.num_vertices,
+#ifdef CITRA_REBASE_INDICES
+        .vertex_offset = is_indexed ? 0 : -static_cast<s32>(vertex_info.vs_input_index_min),
+#else
         .vertex_offset = -static_cast<s32>(vertex_info.vs_input_index_min),
+#endif
         .binding_count = pipeline_info.state.vertex_layout.binding_count,
         .bindings = binding_offsets,
         .is_indexed = is_indexed,
@@ -697,7 +807,11 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
 
 void RasterizerVulkan::SetupIndexArray() {
     const bool index_u8 = regs.pipeline.index_array.format == 0;
+#ifdef CITRA_REBASE_INDICES
+    const bool native_u8 = false; // Rebased indices are always written as u16.
+#else
     const bool native_u8 = index_u8 && instance.IsIndexTypeUint8Supported();
+#endif
     const u32 index_buffer_size = regs.pipeline.num_vertices * (native_u8 ? 1 : 2);
     const vk::IndexType index_type = native_u8 ? vk::IndexType::eUint8EXT : vk::IndexType::eUint16;
 
@@ -707,6 +821,19 @@ void RasterizerVulkan::SetupIndexArray() {
 
     auto [index_ptr, index_offset, _] = stream_buffer.Map(index_buffer_size, 2);
 
+#ifdef CITRA_REBASE_INDICES
+    const u16 base = static_cast<u16>(vertex_info.vs_input_index_min);
+    u16* rebased = reinterpret_cast<u16*>(index_ptr);
+    for (u32 i = 0; i < regs.pipeline.num_vertices; i++) {
+        u16 index;
+        if (index_u8) {
+            index = index_data[i];
+        } else {
+            std::memcpy(&index, index_data + i * 2, sizeof(index));
+        }
+        rebased[i] = static_cast<u16>(index - base);
+    }
+#else
     if (index_u8 && !native_u8) {
         u16* index_ptr_u16 = reinterpret_cast<u16*>(index_ptr);
         for (u32 i = 0; i < regs.pipeline.num_vertices; i++) {
@@ -715,6 +842,7 @@ void RasterizerVulkan::SetupIndexArray() {
     } else {
         std::memcpy(index_ptr, index_data, index_buffer_size);
     }
+#endif
 
     stream_buffer.Commit(index_buffer_size);
     replay_index_offset = index_offset;
@@ -751,6 +879,22 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     SyncDrawState();
 
     const bool shadow_rendering = regs.framebuffer.IsShadowRendering();
+    // RGBA8 surfaces start without storage usage (see TextureRuntime::RGBA8Storage).
+    // The first shadow draw asks for it and is skipped; TickFrame then recreates
+    // every surface with storage, as upstream always does.
+    if (!TextureRuntime::RGBA8Storage()) {
+        const auto& tex0 = regs.texturing.GetTextures()[0];
+        const bool shadow_texture =
+            tex0.enabled && (tex0.config.type == Pica::TexturingRegs::TextureConfig::Shadow2D ||
+                             tex0.config.type == Pica::TexturingRegs::TextureConfig::ShadowCube);
+        if (shadow_rendering || shadow_texture) {
+            if (TextureRuntime::RequestRGBA8Storage()) {
+                LOG_INFO(Render_Vulkan, "Shadow {} used: recreating surfaces with storage usage",
+                         shadow_rendering ? "rendering" : "texture");
+            }
+            return true;
+        }
+    }
     const bool has_stencil = regs.framebuffer.HasStencil();
 
     const bool write_color_fb = shadow_rendering || pipeline_info.GetFinalColorWriteMask(instance);
@@ -798,7 +942,8 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         const auto scissor=fb_helper.Scissor();
         wide_bypass=MM3D::WidescreenProbe::Observe({pica.vs_setup.GetProgramCodeHash(),
             pica.vs_setup.GetSwizzleDataHash(),u32(regs.pipeline.num_vertices),
-            unsigned(wide_viewport.GetWidth()),unsigned(wide_viewport.GetHeight()),
+            MM3D::Widescreen::SignatureWidth(wide_viewport.GetWidth(),wide_viewport.GetHeight()),
+            unsigned(wide_viewport.GetHeight()),
             unsigned(textures.texture0_enable)|(unsigned(textures.texture1_enable)<<1)|(unsigned(textures.texture2_enable)<<2),
             unsigned(merger.alpha_blending.factor_source_rgb.Value())|
                 (unsigned(merger.alpha_blending.factor_dest_rgb.Value())<<4)|
@@ -816,11 +961,81 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         depth.depth_test_enable != 0 &&
         depth.depth_test_func != Pica::FramebufferRegs::CompareFunc::Always &&
         depth.depth_test_func != Pica::FramebufferRegs::CompareFunc::Never;
-    const float zoom_scale = zoom_world ?
+    float zoom_scale = zoom_world ?
         1.f / std::clamp(MM3D::Widescreen::camera_zoom_out.load(), 1.f, 1.5f) : 1.f;
+    bool hud_transform = false;
+    bool wide_hud_draw = false;
+    std::array<double,9> hud_matrix{};
+    // Immersive wide view: pull the HUD toward the middle of the wide image,
+    // where a 3DS would show it. Recognize both layout-shader HUD draws and
+    // the verified world program's orthographic UI draws.
+    // Native map geometry uses the same program as world geometry, with an
+    // orthographic projection. Excluding that entire program left the map in
+    // the head-turned world even though the layout-shader HUD was separated.
+    const bool wide_world_program =
+        pica.vs_setup.GetProgramCodeHash()==0x89b1ab98da3d9241ULL &&
+        pica.vs_setup.GetSwizzleDataHash()==0x6f0b398b1fc186a9ULL;
+    const auto& wide_projection_row = pica.vs_setup.uniforms.f[3];
+    const bool wide_orthographic = wide_world_program &&
+        wide_projection_row.x.ToFloat32()==0 && wide_projection_row.y.ToFloat32()==0 &&
+        wide_projection_row.z.ToFloat32()==0 && wide_projection_row.w.ToFloat32()==1;
+    // Fullscreen scene copies/clears belong to the world. Other orthographic
+    // geometry (including map masks and markers) belongs to the fixed HUD.
+    const auto& wide_blend = pipeline_info.state.blending;
+    const auto& wide_textures = regs.texturing.main_config;
+    const bool wide_replace = !wide_blend.blend_enable ||
+        (wide_blend.src_color_blend_factor==Pica::FramebufferRegs::BlendFactor::One &&
+         wide_blend.dst_color_blend_factor==Pica::FramebufferRegs::BlendFactor::Zero);
+    const bool wide_scene_quad = wide_orthographic && regs.pipeline.num_vertices==4 &&
+        !pipeline_info.state.depth_stencil.stencil_test_enable && wide_replace &&
+        ((!wide_textures.texture0_enable && !wide_textures.texture1_enable &&
+          !wide_textures.texture2_enable) ||
+         midpoint_scene_copies.Contains(MM3D::guest_frames.load(),
+             regs.texturing.texture0.GetPhysicalAddress()));
+    // Fades and flashes (the untextured screen cover, whatever its blending)
+    // cover the whole view too. The letterbox bars that share it are hidden
+    // in the immersive view (ClassicSaving's letterbox hook).
+    const bool wide_screen_cover = wide_orthographic && regs.pipeline.num_vertices==4 &&
+        !pipeline_info.state.depth_stencil.stencil_test_enable &&
+        !wide_textures.texture0_enable && !wide_textures.texture1_enable &&
+        !wide_textures.texture2_enable;
+    const bool wide_top_ui=MM3D::WideView::enabled.load() && !shadow_rendering &&
+       regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress()!=0 &&
+       MM3D::Widescreen::IsTopViewport(wide_viewport.GetWidth(),wide_viewport.GetHeight()) &&
+       (!wide_world_program || (wide_orthographic && !wide_scene_quad && !wide_screen_cover));
+    // Full-screen menus (the pause pages, the Soaring map) stay whole in the
+    // image, as on a 3DS, which the presenter shows on a flat panel.
+    if(wide_top_ui && !MM3D::WideView::menu.load() && (wide_orthographic ||
+       !depth.depth_test_enable || depth.depth_test_func==Pica::FramebufferRegs::CompareFunc::Always)) {
+        const float hud_scale=MM3D::WideView::HudScale(MM3D::WideView::capture.current.tan_y);
+        // Keep it on the game camera's own view, where the character is, and
+        // in that view's plane, rather than following the head look.
+        hud_transform=true;
+        wide_hud_draw=true;
+        hud_matrix=MM3D::WideView::capture.hud;
+        for(int row=0;row<3;++row){hud_matrix[row*3]*=hud_scale;hud_matrix[row*3+1]*=hud_scale;}
+        // Each distinct HUD draw once, to check what this treats as HUD.
+        static std::vector<std::pair<u64,u32>> hud_logged;
+        const std::pair<u64,u32> key{pica.vs_setup.GetProgramCodeHash(),u32(regs.pipeline.num_vertices)};
+        if(hud_scale<1.f && hud_logged.size()<64 &&
+           std::find(hud_logged.begin(),hud_logged.end(),key)==hud_logged.end()) {
+            hud_logged.push_back(key);
+            LOG_INFO(Render_Vulkan,"Wide view HUD draw: shader={:016x} vertices={} scale={:.2f}",
+                key.first,key.second,hud_scale);
+        }
+    }
     if(vs_data.clip_scale_x != zoom_scale || vs_data.clip_scale_y != wide_scale * zoom_scale) {
         vs_data.clip_scale_x = zoom_scale;
         vs_data.clip_scale_y = wide_scale * zoom_scale;
+        vs_data_dirty = true;
+    }
+    if(vs_data.hud_transform != u32(hud_transform) || hud_transform) {
+        vs_data.hud_transform = hud_transform;
+        if(hud_transform) {
+            const auto row=[&](int r){return Common::Vec4f(float(hud_matrix[r*3]),
+                float(hud_matrix[r*3+1]),float(hud_matrix[r*3+2]),0.f);};
+            vs_data.hud_row0=row(0);vs_data.hud_row1=row(1);vs_data.hud_row2=row(2);
+        }
         vs_data_dirty = true;
     }
     if(wide_top) ++MM3D::Widescreen::frame_corrected_draws;
@@ -1082,7 +1297,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         pica.vs_setup.GetProgramCodeHash(), regs.pipeline.num_vertices,
         pipeline_info.dynamic_info.scissor.left, pipeline_info.dynamic_info.scissor.top,
         pipeline_info.dynamic_info.scissor.right, pipeline_info.dynamic_info.scissor.bottom);
-    if(guest_regions.info[0]>0) pipeline_cache.BindPipeline(pipeline_info,true);
+    if(guest_regions.info[0]>0) pipeline_cache.BindPipeline(pipeline_info,!async_shaders);
 #endif
 
     // Every replay must use the same geometry path as the original draw. CPU
@@ -1092,7 +1307,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         if (accelerate) {
             return AccelerateDrawBatchInternal(is_indexed);
         }
-        if (!pipeline_cache.BindPipeline(pipeline_info, true)) {
+        if (!pipeline_cache.BindPipeline(pipeline_info, !async_shaders)) {
             return false;
         }
         if (cpu_interpolation) {
@@ -1143,7 +1358,57 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         }
     }
 #endif
+#ifdef ENABLE_MM3D_PRESENTATION
+    // Immersive wide view: a HUD draw that blends plainly goes to the HUD's
+    // own layer (replayed below) instead of the game image. Others keep the
+    // in-image HUD transform.
+    const auto& hud_blend = pipeline_info.state.blending;
+    using HudBF = Pica::FramebufferRegs::BlendFactor;
+    // Plain alpha blending, opaque pieces, and stencil-only masks (the round
+    // minimap) go to the layer, which has its own stencil.
+    const bool hud_alpha = hud_blend.blend_enable &&
+        hud_blend.src_color_blend_factor == HudBF::SourceAlpha &&
+        hud_blend.dst_color_blend_factor == HudBF::OneMinusSourceAlpha &&
+        hud_blend.color_blend_eq == Pica::FramebufferRegs::BlendEquation::Add &&
+        (hud_blend.color_write_mask & 7) == 7;
+    const bool hud_opaque = (!hud_blend.blend_enable ||
+        (hud_blend.src_color_blend_factor == HudBF::One &&
+         hud_blend.dst_color_blend_factor == HudBF::Zero &&
+         hud_blend.color_blend_eq == Pica::FramebufferRegs::BlendEquation::Add)) &&
+        (hud_blend.color_write_mask & 7) == 7;
+    const bool hud_mask = (hud_blend.color_write_mask & 7) == 0 &&
+        pipeline_info.state.depth_stencil.stencil_test_enable;
+    const bool wide_hud_layer = wide_hud_draw && (hud_alpha || hud_opaque || hud_mask) &&
+        viewport.x >= 0 && viewport.y >= 0 && viewport.width > 0 && viewport.height > 0;
+    // What stays in the game image, once per kind, to find HUD pieces left out.
+    if (wide_top_ui && !wide_hud_layer) {
+        static std::vector<std::array<u64,2>> kept_logged;
+        const std::array<u64,2> key{pica.vs_setup.GetProgramCodeHash(),
+            u64(regs.pipeline.num_vertices) | (u64(depth.depth_test_enable) << 32) |
+            (u64(pipeline_info.state.depth_stencil.stencil_test_enable) << 33)};
+        if (kept_logged.size() < 48 &&
+            std::find(kept_logged.begin(), kept_logged.end(), key) == kept_logged.end()) {
+            kept_logged.push_back(key);
+            LOG_INFO(Render_Vulkan, "Wide view: top draw kept in the image: shader={:016x} "
+                "vertices={} depth={} func={} stencil={} blend={} src={} dst={} mask={}",
+                key[0], regs.pipeline.num_vertices, u32(depth.depth_test_enable),
+                u32(depth.depth_test_func.Value()),
+                u32(pipeline_info.state.depth_stencil.stencil_test_enable),
+                u32(hud_blend.blend_enable), u32(hud_blend.src_color_blend_factor.Value()),
+                u32(hud_blend.dst_color_blend_factor.Value()), u32(hud_blend.color_write_mask));
+        }
+    }
+    if (wide_hud_layer) {
+        MM3D::Profiles::Profile hud;
+        hud.id = MM3D::WideView::HudLayerId;
+        hud.presentation = true;
+        hud.source_top = true;
+        mm3d_draw_profiles.push_back(hud);
+    }
+    const bool succeeded = wide_hud_layer ? true : draw_batch();
+#else
     const bool succeeded = draw_batch();
+#endif
     native_draw_scope.End();
 
 #ifdef ENABLE_MM3D_PRESENTATION
@@ -1164,6 +1429,78 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     // Depth-disabled/always-pass perspective draws include sky and translucent
     // effects. Keep their native depth/blending state and original draw order;
     // perspective + verified shader identify this path, not depth testing alone.
+    // Immersive wide view: tag the guest frame with its world camera, for the
+    // presenter to place the frame (mm3d/wide_view.h).
+    if(MM3D::WideView::enabled.load() && succeeded && !shadow_rendering && using_color_fb &&
+       MM3D::Widescreen::IsTopViewport(wide_viewport.GetWidth(),wide_viewport.GetHeight()) &&
+       pica.vs_setup.GetProgramCodeHash()==0x89b1ab98da3d9241ULL &&
+       pica.vs_setup.GetSwizzleDataHash()==0x6f0b398b1fc186a9ULL) {
+        auto camera=MM3D::CameraMidpoint::Identity();
+        MM3D::CameraMidpoint::Matrix projection{};
+        for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)
+            projection[r][c]=pica.vs_setup.uniforms.f[r][c].ToFloat32();
+        for(unsigned r=0;r<3;++r)for(unsigned c=0;c<4;++c)
+            camera[r][c]=pica.vs_setup.uniforms.f[70+r][c].ToFloat32();
+        // A few samples per session, to check the camera's axes on device.
+        static unsigned wide_logged=0;
+        if(wide_logged<4 && MM3D::guest_frames.load()%120==0) {
+            ++wide_logged;
+            LOG_INFO(Render_Vulkan,"Wide view camera x=({:.3f},{:.3f},{:.3f}) y=({:.3f},{:.3f},{:.3f}) "
+                "z=({:.3f},{:.3f},{:.3f}) projection p00={:.3f} p01={:.3f} p10={:.3f} p11={:.3f}",
+                camera[0][0],camera[1][0],camera[2][0],camera[0][1],camera[1][1],camera[2][1],
+                camera[0][2],camera[1][2],camera[2][2],projection[0][0],projection[0][1],
+                projection[1][0],projection[1][1]);
+        }
+        // The first verified world camera of each guest frame is the one recorded.
+        if(MM3D::guest_frames.load()!=MM3D::WideView::capture.guest_frame &&
+           MM3D::CameraMidpoint::Rigid(camera) && MM3D::CameraMidpoint::WorldProjection(projection) &&
+           !MM3D::CameraMidpoint::TitleLogoCamera(camera,projection)) {
+            auto wide=MM3D::WideView::FromMatrices(camera,projection,1.f/zoom_scale,wide_scale);
+            // The turn behind this drawn frame, found by its view direction.
+            const float forward[3]={float(-camera[0][2]),float(-camera[1][2]),float(-camera[2][2])};
+            if(MM3D::WideView::applied_look.load()) {
+                // No match (the view changed in a way not seen): the newest turn.
+                const auto match=MM3D::WideView::MatchAppliedLook(forward);
+                wide.head_look=true;
+                wide.head_yaw=match?match->look.yaw:MM3D::WideView::applied_yaw.load();
+                wide.head_pitch=match?match->look.pitch:MM3D::WideView::applied_pitch.load();
+                static unsigned inexact=0,unturned=0,frames=0;
+                ++frames;
+                if(match && match->unturned)++unturned;
+                // Only a real turn makes the unturned view land elsewhere (2 degrees).
+                wide.unturned=match && match->unturned &&
+                    (std::abs(MM3D::WideView::applied_yaw.load())>0.035f ||
+                     std::abs(MM3D::WideView::applied_pitch.load())>0.035f);
+                if(match && !match->exact && (++inexact<=8 || inexact%100==0))
+                    LOG_INFO(Render_Vulkan,"Wide view: inexact head turn match ({} of {} frames, "
+                        "{} unturned; nearest {:.2f} degrees away{})",inexact,frames,unturned,
+                        std::acos(std::clamp(match->dot,-1.f,1.f))*57.29578f,
+                        match->unturned?", unturned":"");
+            }
+            static float logged_tan_x=0,logged_tan_y=0;
+            if(wide.valid && (std::abs(wide.tan_x-logged_tan_x)>.02f*logged_tan_x+1e-4f ||
+                              std::abs(wide.tan_y-logged_tan_y)>.02f*logged_tan_y+1e-4f)) {
+                logged_tan_x=wide.tan_x;logged_tan_y=wide.tan_y;
+                LOG_INFO(Render_Vulkan,"Wide view angles: {:.1f} x {:.1f} degrees",
+                    2*std::atan(wide.tan_x)*57.29578f,2*std::atan(wide.tan_y)*57.29578f);
+            }
+            MM3D::WideView::Record(MM3D::guest_frames.load(),wide);
+            // Immersive view diagnostics: what draws the recorded world, every 2 s.
+            static u64 world_logged=0;
+            if(MM3D::guest_frames.load()>=world_logged+120) {
+                world_logged=MM3D::guest_frames.load();
+                LOG_INFO(Render_Vulkan,"Wide view world: frame {} vertices={} tan {:.3f} x {:.3f} "
+                    "depth={} head_look={} unturned={}",world_logged,regs.pipeline.num_vertices,
+                    wide.tan_x,wide.tan_y,u32(regs.framebuffer.output_merger.depth_test_enable),
+                    wide.head_look,wide.unturned);
+            }
+            const auto hud=MM3D::WideView::HudTransform(projection,
+                wide.head_look?wide.head_yaw:0.f,wide.head_look?wide.head_pitch:0.f,
+                MM3D::WideView::anchor_pitch.load(),zoom_scale,wide_scale*zoom_scale);
+            MM3D::WideView::capture.hud=hud.value_or(std::array<double,9>{
+                zoom_scale,0,0, 0,wide_scale*zoom_scale,0, 0,0,1});
+        }
+    }
     if(MM3D::CameraMidpoint::enabled.load() && !midpoint_title_logo && replay_world && succeeded &&
        MM3D::Widescreen::supported_layout.load() && !shadow_rendering && using_color_fb &&
        MM3D::Widescreen::IsTopViewport(wide_viewport.GetWidth(),wide_viewport.GetHeight()) &&
@@ -1445,7 +1782,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
                     pipeline_info.state.attachments.depth=VideoCore::PixelFormat::D24S8;
                     pipeline_info.dynamic_info.viewport={viewport.x,viewport.y,viewport.x+viewport.width,viewport.y+viewport.height};
                     pipeline_info.dynamic_info.scissor=draw_rect;
-                    pipeline_cache.BindPipeline(pipeline_info,true);
+                    pipeline_cache.BindPipeline(pipeline_info,!async_shaders);
                     const auto native_bindings=binding_offsets;
                     if(accelerate && ripple_offsets && !fallback && !native_preview.load()) {
                         binding_offsets[0]=(*ripple_offsets)[0];binding_offsets[1]=(*ripple_offsets)[1];
@@ -1493,7 +1830,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         pipeline_info.dynamic_info.viewport={viewport.x,viewport.y,viewport.x+viewport.width,viewport.y+viewport.height};
         pipeline_info.dynamic_info.scissor=draw_rect;
         transform_viewport(match);
-        pipeline_cache.BindPipeline(pipeline_info,true);
+        pipeline_cache.BindPipeline(pipeline_info,!async_shaders);
         draw_batch();
     }
     for (const auto& panel : MM3D::Profiles::Panels()) {
@@ -1542,7 +1879,8 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
             projection[i][j]=pica.vs_setup.uniforms.f[i][j].ToFloat32();
         const MM3D::WidescreenProbe::Draw candidate{
             pica.vs_setup.GetProgramCodeHash(),pica.vs_setup.GetSwizzleDataHash(),
-            u32(regs.pipeline.num_vertices),unsigned(wide_viewport.GetWidth()),
+            u32(regs.pipeline.num_vertices),
+            MM3D::Widescreen::SignatureWidth(wide_viewport.GetWidth(),wide_viewport.GetHeight()),
             unsigned(wide_viewport.GetHeight()),
             unsigned(textures.texture0_enable)|(unsigned(textures.texture1_enable)<<1)|
                 (unsigned(textures.texture2_enable)<<2),
@@ -1681,7 +2019,11 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
             blend.color_blend_eq==BE::Add && blend.color_write_mask==15 &&
             textures.texture0_enable && !textures.texture1_enable && !textures.texture2_enable;
         if(lens_mask && replay_geometry && succeeded)midpoint_stencil_frame=frame;
-        if((ortho || layout || fade || midpoint_title_logo) && !scene_copy && !scene_clear) {
+        // Immersive HUD draws have already been routed to the stationary HUD.
+        // Replaying them here would put a second, head-tracked copy into every
+        // interpolated world frame.
+        if((ortho || layout || fade || midpoint_title_logo) && !scene_copy && !scene_clear &&
+           !wide_hud_layer) {
             if(!replay_geometry || (pipeline_info.state.depth_stencil.stencil_test_enable &&
                               midpoint_stencil_frame!=frame && !midpoint_title_logo)) {
                 reject_midpoint_hud(1);
@@ -1703,6 +2045,11 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     const float native_clip_x=vs_data.clip_scale_x,native_clip_y=vs_data.clip_scale_y;
     for (const auto& match : mm3d_draw_profiles) {
         if (!match.presentation) continue;
+        // In stereo, top-screen captures come from the left eye only; the right
+        // eye's copy of the same draw would double the image. The midpoint
+        // layers are kept per eye instead (SetMidpointEye).
+        if(midpoint_eye==1 && match.source_top && match.id!="@camera_midpoint" &&
+           match.id!="@camera_midpoint_hud")continue;
         // Initial atlas presentation supports the full, rotated 320x240 lower-screen viewport.
         // Do not accidentally replay top-screen uses of the same HUD atlas.
         if(match.atlas_selection && (viewport.width<=0 || viewport.height<=0 ||
@@ -1769,13 +2116,14 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
                 }
             }
         }
-        const bool supported = !shadow_rendering &&
+        const bool wide_hud_match = match.id == MM3D::WideView::HudLayerId;
+        const bool supported = !shadow_rendering && (wide_hud_match || (
             (minimap || top_ui_source || (!pipeline_info.state.depth_stencil.stencil_test_enable &&
              (!pipeline_info.state.depth_stencil.depth_test_enable ||
               pipeline_info.state.depth_stencil.depth_compare_op == Pica::FramebufferRegs::CompareFunc::Always))) &&
             (stencil_scene || additive || (minimap && !blend.blend_enable) || (blend.blend_enable && blend.src_color_blend_factor == BF::SourceAlpha &&
             blend.dst_color_blend_factor == BF::OneMinusSourceAlpha && blend.color_blend_eq == BE::Add)) &&
-            (stencil_scene || (blend.color_write_mask & 7) == 7) &&
+            (stencil_scene || (blend.color_write_mask & 7) == 7))) &&
             viewport.x >= 0 && viewport.y >= 0 && viewport.width > 0 && viewport.height > 0;
         if (supported) {
             if (!prompt_layers.contains(match.id) && prompt_layers.size() >= 16) {
@@ -1784,7 +2132,9 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
                 continue;
             }
             auto& prompt_layer = prompt_layers[match.id];
-            if (!prompt_layer) prompt_layer = std::make_unique<MM3D::PromptLayer>(instance, scheduler, renderpass_cache,midpoint_ui);
+            const bool wide_hud_layer_id = match.id == MM3D::WideView::HudLayerId;
+            if (!prompt_layer) prompt_layer = std::make_unique<MM3D::PromptLayer>(instance, scheduler, renderpass_cache,
+                midpoint_ui || wide_hud_layer_id);
             if(scene_background && midpoint_target_frame!=MM3D::guest_frames.load()) {
                 prompt_layer->NextFrame();midpoint_target_frame=MM3D::guest_frames.load();
                 midpoint_frame_interpolated=false;
@@ -1808,8 +2158,25 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
             if(match.atlas_selection) MM3D::Atlas::Build(match,atlas_uniforms);
             fs_data_dirty=true; UploadUniforms(accelerate);
             pipeline_cache.UseFragmentShader(regs,user_config,match.atlas_selection);
-            const unsigned w = std::max<unsigned>(draw_rect.right, viewport.x + viewport.width);
-            const unsigned h = std::max<unsigned>(draw_rect.top, viewport.y + viewport.height);
+            unsigned w = std::max<unsigned>(draw_rect.right, viewport.x + viewport.width);
+            unsigned h = std::max<unsigned>(draw_rect.top, viewport.y + viewport.height);
+            // The wide view's HUD layer is supersampled (sharper when shown
+            // smaller), and drawn without the in-image HUD transform.
+            const bool wide_hud_replay = match.id == MM3D::WideView::HudLayerId;
+            const float hud_k = wide_hud_replay ?
+                MM3D::WideView::HudLayerScale(std::min(viewport.width, viewport.height)) : 1.f;
+            const auto scaled = [hud_k](auto v) { return decltype(v)(std::lround(float(v) * hud_k)); };
+            const auto saved_fs_scissor = std::array{fs_data.scissor_x1, fs_data.scissor_x2,
+                                                     fs_data.scissor_y1, fs_data.scissor_y2};
+            if (wide_hud_replay) {
+                w = scaled(w); h = scaled(h);
+                vs_data.hud_transform = 0; vs_data_dirty = true;
+                fs_data.scissor_x1 = scaled(fs_data.scissor_x1);
+                fs_data.scissor_x2 = scaled(fs_data.scissor_x2);
+                fs_data.scissor_y1 = scaled(fs_data.scissor_y1);
+                fs_data.scissor_y2 = scaled(fs_data.scissor_y2);
+                fs_data_dirty = true; UploadUniforms(accelerate);
+            }
             const bool title_depth=midpoint_ui && midpoint_title_logo;
             const auto depth_compare=regs.framebuffer.output_merger.depth_test_func.Value();
             using CF=Pica::FramebufferRegs::CompareFunc;
@@ -1821,11 +2188,21 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
                 pipeline_info.dynamic_info.viewport = {viewport.x,viewport.y,
                     viewport.x+viewport.width,viewport.y+viewport.height};
                 pipeline_info.dynamic_info.scissor = draw_rect;
+                if (wide_hud_replay) {
+                    auto& v = pipeline_info.dynamic_info.viewport;
+                    v = {scaled(v.left), scaled(v.top), scaled(v.right), scaled(v.bottom)};
+                    auto& r = pipeline_info.dynamic_info.scissor;
+                    r = {scaled(r.left), scaled(r.top), scaled(r.right), scaled(r.bottom)};
+                }
                 pipeline_info.state.attachments.color = VideoCore::PixelFormat::RGBA8;
-                pipeline_info.state.attachments.depth = midpoint_ui?VideoCore::PixelFormat::D24S8:VideoCore::PixelFormat::Invalid;
-                if(!stencil_scene && !title_depth)pipeline_info.state.depth_stencil.value = 0;
+                pipeline_info.state.attachments.depth = midpoint_ui || wide_hud_replay ?
+                    VideoCore::PixelFormat::D24S8:VideoCore::PixelFormat::Invalid;
+                // The wide view's HUD layer keeps the draw's stencil (masks).
+                if(!stencil_scene && !title_depth && !wide_hud_replay)pipeline_info.state.depth_stencil.value = 0;
                 auto& copy_blend = pipeline_info.state.blending;
-                if(!stencil_scene)copy_blend.color_write_mask = 15;
+                // Stencil-only masks stay colourless in the wide view's HUD layer.
+                const bool keep_mask = wide_hud_replay && (copy_blend.color_write_mask & 7) == 0;
+                if(!stencil_scene && !keep_mask)copy_blend.color_write_mask = 15;
                 // Alpha stores accumulated coverage, not brightness. An additive
                 // flare contributes RGB but preserves prior coverage. Later HUD
                 // or bars still attenuate it in the game's submission order.
@@ -1841,10 +2218,15 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
                    !MM3D::CameraMidpoint::native_preview.load())binding_offsets[0]=*glare_vertex_offset;
                 draw_batch();
                 binding_offsets[0]=native_position;
-                prompt_layer->x = viewport.x; prompt_layer->y = viewport.y;
-                prompt_layer->viewport_width = viewport.width;
-                prompt_layer->viewport_height = viewport.height;
+                prompt_layer->x = scaled(viewport.x); prompt_layer->y = scaled(viewport.y);
+                prompt_layer->viewport_width = scaled(viewport.width);
+                prompt_layer->viewport_height = scaled(viewport.height);
                 prompt_layer->End(!midpoint_ui);
+                if (wide_hud_replay) {
+                    fs_data.scissor_x1 = saved_fs_scissor[0]; fs_data.scissor_x2 = saved_fs_scissor[1];
+                    fs_data.scissor_y1 = saved_fs_scissor[2]; fs_data.scissor_y2 = saved_fs_scissor[3];
+                    fs_data_dirty = true;
+                }
                 pipeline_info = saved;
                 if(minimap) ++MM3D::Minimap::draws;
                 MM3D::prompt_replays.fetch_add(1);
@@ -2129,6 +2511,7 @@ void RasterizerVulkan::BindTextureCube(const Pica::TexturingRegs::FullTextureCon
 
 #ifdef ENABLE_MM3D_PRESENTATION
 void RasterizerVulkan::EndGuestFrame() {
+    SetMidpointEye(0);
     if (!visibility_depth_refresh_enabled) return;
     if (!visibility_depth || !visibility_depth->SourceAddress()) return;
     if (!visibility_depth_enabled || !MM3D::CameraMidpoint::enabled.load()) {
@@ -2255,6 +2638,7 @@ void RasterizerVulkan::ClearAll(bool flush) {
     midpoint_target_frame.reset();midpoint_world_frame.reset();midpoint_opaque_world_frame.reset();midpoint_stencil_frame.reset();midpoint_fade_frame.reset();midpoint_title_depth_frame.reset();
     for(const auto id : {"@camera_midpoint","@camera_midpoint_fade","@camera_midpoint_hud"})
         if(const auto it=prompt_layers.find(id);it!=prompt_layers.end())it->second->NextFrame();
+    ResetMidpointOtherEye();
 #endif
     res_cache.ClearAll(flush);
 }
@@ -2275,6 +2659,16 @@ bool RasterizerVulkan::AccelerateDisplayTransfer(const Pica::DisplayTransferConf
     }
     midpoint_scene_copies.Transfer(MM3D::guest_frames.load(),
         result?config.GetPhysicalInputAddress():0,config.GetPhysicalOutputAddress());
+    // When the game renders stereo, top-screen draws after the left eye's copy
+    // to its display buffer are the right eye's; its copy ends that eye. Track
+    // this even without 3D output: after 3D is turned off the game may keep
+    // drawing a right eye, which must not land in the left eye's midpoint.
+    {
+        const auto& screen=pica.regs.framebuffer_config[0];
+        const auto output=config.GetPhysicalOutputAddress();
+        if(output==screen.address_left1 || output==screen.address_left2)SetMidpointEye(1);
+        else if(output==screen.address_right1 || output==screen.address_right2)SetMidpointEye(0);
+    }
 #endif
     return result;
 }
@@ -2412,6 +2806,10 @@ void RasterizerVulkan::SyncAndUploadLUTsLF() {
     }
 
     texture_lf_buffer.Commit(static_cast<u32>(bytes_used));
+#ifdef CITRA_PRIVATE_TEXEL_BUFFERS
+    renderpass_cache.EndRendering();
+    texture_lf_private.Upload(scheduler, texture_lf_buffer.Handle(), offset, bytes_used);
+#endif
 }
 
 void RasterizerVulkan::SyncAndUploadLUTs() {
@@ -2486,6 +2884,10 @@ void RasterizerVulkan::SyncAndUploadLUTs() {
     pica.proctex.table_dirty = 0;
 
     texture_buffer.Commit(static_cast<u32>(bytes_used));
+#ifdef CITRA_PRIVATE_TEXEL_BUFFERS
+    renderpass_cache.EndRendering();
+    texture_private.Upload(scheduler, texture_buffer.Handle(), offset, bytes_used);
+#endif
 }
 
 void RasterizerVulkan::UploadUniforms(bool accelerate_draw) {
@@ -2543,6 +2945,10 @@ void RasterizerVulkan::UploadUniforms(bool accelerate_draw) {
     uniform_buffer.Commit(used_bytes);
 }
 
+void RasterizerVulkan::SaveDiskResources() {
+    pipeline_cache.SaveDriverPipelineDiskCache();
+}
+
 void RasterizerVulkan::SwitchDiskResources(u64 title_id) {
 #ifdef ENABLE_MM3D_PRESENTATION
     ResetPause();
@@ -2550,6 +2956,7 @@ void RasterizerVulkan::SwitchDiskResources(u64 title_id) {
     midpoint_target_frame.reset();midpoint_world_frame.reset();midpoint_opaque_world_frame.reset();midpoint_stencil_frame.reset();midpoint_fade_frame.reset();midpoint_title_depth_frame.reset();
     for(const auto id : {"@camera_midpoint","@camera_midpoint_fade","@camera_midpoint_hud"})
         if(const auto it=prompt_layers.find(id);it!=prompt_layers.end())it->second->NextFrame();
+    ResetMidpointOtherEye();
 #endif
     std::atomic_bool stop_loading = false;
 

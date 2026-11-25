@@ -66,6 +66,9 @@ public:
     void SwitchCache(u64 title_id, const std::atomic_bool& stop_loading = std::atomic_bool{false},
                      const VideoCore::DiskResourceLoadCallback& callback = {});
 
+    /// Stores the generated pipeline cache
+    void SaveDriverPipelineDiskCache();
+
     /// Binds a pipeline using the provided information
     bool BindPipeline(PipelineInfo& info, bool wait_built = false);
 
@@ -108,9 +111,6 @@ private:
     /// Loads the driver pipeline cache
     void LoadDriverPipelineDiskCache(const std::atomic_bool& stop_loading = std::atomic_bool{false},
                                      const VideoCore::DiskResourceLoadCallback& callback = {});
-
-    /// Stores the generated pipeline cache
-    void SaveDriverPipelineDiskCache();
 
     /// Loads the shader disk cache
     void LoadDiskCache(const std::atomic_bool& stop_loading = std::atomic_bool{false},

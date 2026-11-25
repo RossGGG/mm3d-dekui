@@ -10,6 +10,7 @@
 #include "mm3d/interpolation_performance.h"
 #endif
 #include <utility>
+#include "common/hitch_trace.h"
 #include "common/microprofile.h"
 #include "common/thread.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -52,6 +53,20 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf) {
     first = nullptr;
     last = nullptr;
 }
+
+#ifdef ENABLE_MM3D_PRESENTATION
+namespace {
+/// GPU timestamps around every command buffer, for Hitch lines. They cost two
+/// timestamp writes per submission; DEKUI_HITCH_GPU_TIMING=0 turns them off.
+bool HitchGpuTiming() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("DEKUI_HITCH_GPU_TIMING");
+        return !value || std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+} // namespace
+#endif
 
 Scheduler::Scheduler(const Instance& instance)
     : device{instance.GetDevice()}, graphics_queue{instance.GetGraphicsQueue()},
@@ -232,8 +247,11 @@ void Scheduler::FinishNativeReadback([[maybe_unused]] std::source_location calle
     } else {
         AllocateWorkerCommandBuffers();
     }
-    while (device.waitForFences(*readback_fence, true, std::numeric_limits<u64>::max()) !=
-           vk::Result::eSuccess) {}
+    {
+        const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::GpuWait};
+        while (device.waitForFences(*readback_fence, true, std::numeric_limits<u64>::max()) !=
+               vk::Result::eSuccess) {}
+    }
 #ifdef ENABLE_MM3D_PRESENTATION
     if (trace) trace->completed = MM3D::InterpolationPerformance::Now();
 #endif
@@ -252,6 +270,7 @@ void Scheduler::WaitWorkerCommands() {
 #ifdef ENABLE_MM3D_PRESENTATION
     MM3D::InterpolationPerformance::Scope timing{MM3D::InterpolationPerformance::Part::WorkerWait};
 #endif
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::WorkerWait};
     MICROPROFILE_SCOPE(Vulkan_WaitForWorker);
     DispatchWork();
 
@@ -269,6 +288,7 @@ void Scheduler::WaitWorkerCommands() {
 void Scheduler::Wait(u64 tick, [[maybe_unused]] std::source_location caller) {
     if (IsFree(tick))
         return;
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::GpuWait};
 #ifdef ENABLE_MM3D_PRESENTATION
     MM3D::InterpolationPerformance::WaitSiteScope source_timing{caller};
     MM3D::InterpolationPerformance::Scope timing{MM3D::InterpolationPerformance::Part::GpuWait};
@@ -374,11 +394,13 @@ void Scheduler::AllocateWorkerCommandBuffers() {
                 slot.trace->gpu_ns = ns;
                 slot.trace->gpu_available = true;
             }
-            MM3D::InterpolationPerformance::AddGpuPart(slot.session,slot.phase,ns);
+            if(slot.session)MM3D::InterpolationPerformance::AddGpuPart(slot.session,slot.phase,ns);
+            Common::HitchTrace::Add(Common::HitchTrace::Phase::Gpu,std::chrono::nanoseconds(ns));
             slot={};
         }
+        // Hitch lines report GPU time too; session 0 marks a slot only they use.
         const auto session=MM3D::InterpolationPerformance::ActiveSession();
-        if(session)for(u32 i=0;i<timing_slots.size();++i) {
+        if(session || HitchGpuTiming())for(u32 i=0;i<timing_slots.size();++i) {
             if(timing_slots[i].tick)continue;
             timing_slot=static_cast<int>(i);
             timing_slots[i].session=session;

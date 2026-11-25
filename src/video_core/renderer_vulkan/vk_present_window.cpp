@@ -2,10 +2,13 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <optional>
+#include "common/hitch_trace.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
+#include "video_core/renderer_vulkan/vk_external_present.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_present_window.h"
@@ -158,7 +161,9 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
         use_present_thread = true;
         // Font upload uses the same Vulkan queue; serialize with the scheduler.
         std::scoped_lock lock{scheduler.submit_mutex};
-        mm3d_overlay = std::make_unique<MM3D::Overlay>(instance, GetSurfaceFormat(), num_images, &scheduler.submit_mutex);
+        // Stereo frames draw the overlay once per eye, using two of its buffer sets.
+        mm3d_overlay = std::make_unique<MM3D::Overlay>(instance, GetSurfaceFormat(), num_images * 2,
+                                                       &scheduler.submit_mutex);
     }
 #endif
     if (use_present_thread) {
@@ -180,12 +185,19 @@ PresentWindow::~PresentWindow() {
         instance.GetDevice().waitIdle();
         mm3d_overlay.reset();
         auto& background = mm3d_background;
+        instance.GetDevice().destroyFramebuffer(background.host_hud_framebuffer);
+        instance.GetDevice().destroyImageView(background.host_hud_view);
+        if (background.host_hud_image)
+            vmaDestroyImage(instance.GetAllocator(), background.host_hud_image,
+                            background.host_hud_allocation);
         instance.GetDevice().destroyFramebuffer(background.framebuffer);
         instance.GetDevice().destroyImageView(background.image_view);
         if (background.image)
             vmaDestroyImage(instance.GetAllocator(), background.image, background.allocation);
     }
 #endif
+    // Frame images may still be the source of an external sink's copy.
+    ExternalPresent::WaitForReads(nullptr);
     const vk::Device device = instance.GetDevice();
     // If the window is destroyed before the next_surface is
     // consumed, make sure to destroy it here to prevent a
@@ -202,11 +214,32 @@ PresentWindow::~PresentWindow() {
         device.destroySemaphore(frame.render_ready);
         device.destroyFence(frame.present_done);
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
+#ifdef ENABLE_MM3D_PRESENTATION
+        device.destroyFramebuffer(frame.host_hud_framebuffer);
+        device.destroyImageView(frame.host_hud_view);
+        if (frame.host_hud_image)
+            vmaDestroyImage(instance.GetAllocator(), frame.host_hud_image,
+                            frame.host_hud_allocation);
+        if (frame.hud_image)
+            vmaDestroyImage(instance.GetAllocator(), frame.hud_image, frame.hud_allocation);
+#endif
     }
 }
 
 void PresentWindow::RecreateFrame(Frame* frame, u32 width, u32 height) {
     vk::Device device = instance.GetDevice();
+#ifdef ENABLE_MM3D_PRESENTATION
+    device.destroyFramebuffer(frame->host_hud_framebuffer);
+    device.destroyImageView(frame->host_hud_view);
+    if (frame->host_hud_image) {
+        vmaDestroyImage(instance.GetAllocator(), frame->host_hud_image,
+                        frame->host_hud_allocation);
+    }
+    frame->host_hud_framebuffer = nullptr;
+    frame->host_hud_view = nullptr;
+    frame->host_hud_image = nullptr;
+    frame->host_hud_valid = false;
+#endif
     if (frame->framebuffer) {
         device.destroyFramebuffer(frame->framebuffer);
     }
@@ -240,6 +273,10 @@ void PresentWindow::RecreateFrame(Frame* frame, u32 width, u32 height) {
 
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
+    if (instance.HasMetalObjects()) {
+        // Lets an external presenter read the frame (see vk_external_present.h).
+        unsafe_image_info.pNext = ExternalPresent::ExportCreateInfo();
+    }
 
     VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
                                      &unsafe_image, &frame->allocation, nullptr);
@@ -273,6 +310,28 @@ void PresentWindow::RecreateFrame(Frame* frame, u32 width, u32 height) {
     };
     frame->framebuffer = instance.GetDevice().createFramebuffer(framebuffer_info);
 
+#ifdef ENABLE_MM3D_PRESENTATION
+    // The late HUD uses the same render pass and pixel format as the composed
+    // frame, but starts transparent and is exported independently to Metal.
+    if (instance.HasMetalObjects()) {
+        VkImage host_image{};
+        result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
+                                &host_image, &frame->host_hud_allocation, nullptr);
+        if (result != VK_SUCCESS) [[unlikely]] {
+            LOG_CRITICAL(Render_Vulkan, "Failed allocating immersive host HUD with error {}",
+                         result);
+            UNREACHABLE();
+        }
+        frame->host_hud_image = vk::Image{host_image};
+        auto host_view_info = view_info;
+        host_view_info.image = frame->host_hud_image;
+        frame->host_hud_view = device.createImageView(host_view_info);
+        auto host_framebuffer_info = framebuffer_info;
+        host_framebuffer_info.pAttachments = &frame->host_hud_view;
+        frame->host_hud_framebuffer = device.createFramebuffer(host_framebuffer_info);
+    }
+#endif
+
     frame->width = width;
     frame->height = height;
 }
@@ -282,7 +341,10 @@ Frame* PresentWindow::GetRenderFrame() {
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
-    free_cv.wait(lock, [this] { return !free_queue.empty(); });
+    {
+        const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::PresentSlot};
+        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+    }
 
     // Take the frame from the queue
     Frame* frame = free_queue.front();
@@ -297,6 +359,7 @@ Frame* PresentWindow::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::PresentFence};
     while (wait() != vk::Result::eSuccess) {
         // Retry if the waiting times out
         if (result == vk::Result::eTimeout) {
@@ -312,7 +375,25 @@ Frame* PresentWindow::GetRenderFrame() {
     }
 
     device.resetFences(frame->present_done);
+    // The sink may still be copying this frame from an earlier delivery.
+    WaitForExternalReads(frame);
     return frame;
+}
+
+void PresentWindow::WaitForExternalReads(Frame* frame) {
+    if (!ExternalPresent::Active()) {
+        return;
+    }
+    const vk::Device device = instance.GetDevice();
+    ExternalPresent::WaitForReads(ExternalPresent::MetalTexture(device, frame->image));
+#ifdef ENABLE_MM3D_PRESENTATION
+    if (frame->hud_image) {
+        ExternalPresent::WaitForReads(ExternalPresent::MetalTexture(device, frame->hud_image));
+    }
+    if (frame->host_hud_image) {
+        ExternalPresent::WaitForReads(ExternalPresent::MetalTexture(device, frame->host_hud_image));
+    }
+#endif
 }
 
 void PresentWindow::Present(Frame* frame) {
@@ -451,78 +532,8 @@ void PresentWindow::NotifySurfaceChanged() {
 #endif
 }
 
-void PresentWindow::CopyToSwapchain(Frame* frame, bool repeat) {
 #ifdef ENABLE_MM3D_PRESENTATION
-    MM3D::InterpolationPerformance::PresentTrace present_trace;
-    present_trace.session = MM3D::InterpolationPerformance::ActiveSession();
-    if (present_trace.session) {
-        present_trace.owner = reinterpret_cast<std::uintptr_t>(&scheduler);
-        present_trace.started = MM3D::InterpolationPerformance::Now();
-        present_trace.shared_queue = instance.GetPresentQueue() == instance.GetGraphicsQueue();
-    }
-    const auto pacing_now=std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    const auto pacing_deadline=midpoint_pacer.Deadline(pacing_now,frame->interpolated_pair && !repeat);
-    if(pacing_deadline>pacing_now) {
-        const auto target=std::chrono::steady_clock::time_point{
-            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::nanoseconds{pacing_deadline})};
-        // OS timer coalescing can overshoot a simple sleep by several ms. Sleep
-        // for the bulk, then yield for at most the final 3 ms (no unbounded spin).
-        const auto coarse=target-std::chrono::milliseconds(3);
-        if(std::chrono::steady_clock::now()<coarse)std::this_thread::sleep_until(coarse);
-        while(std::chrono::steady_clock::now()<target)std::this_thread::yield();
-    }
-    if(frame->input_timing.id) {
-        frame->input_timing.pacing_arrival=pacing_now/1000;
-        frame->input_timing.pacing_deadline=pacing_deadline/1000;
-        frame->input_timing.paired=frame->interpolated_pair && !repeat;
-    }
-    const auto timing_copy=frame->input_timing.id?MM3D::InputLatency::Now():0;
-    if (present_trace.session) present_trace.paced = MM3D::InterpolationPerformance::Now();
-#endif
-    const auto recreate_swapchain = [&] {
-#ifdef ANDROID
-        {
-            std::unique_lock lock{recreate_surface_mutex};
-            recreate_surface_cv.wait(lock, [this]() { return surface != next_surface; });
-            surface = next_surface;
-        }
-#endif
-        auto& queue_mutex=instance.GetPresentQueue()==instance.GetGraphicsQueue() ?
-            scheduler.submit_mutex : instance.PresentQueueMutex();
-        std::scoped_lock submit_lock{queue_mutex};
-        graphics_queue.waitIdle();
-        swapchain.Create(frame->width, frame->height, surface, low_refresh_rate);
-    };
-
-#ifndef ANDROID
-    const bool use_vsync = Settings::values.use_vsync.GetValue();
-    const bool size_changed =
-        swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
-    const bool vsync_changed = vsync_enabled != use_vsync;
-    if (vsync_changed || size_changed) [[unlikely]] {
-        vsync_enabled = use_vsync;
-        recreate_swapchain();
-    }
-#endif
-
-    while (!swapchain.AcquireNextImage()) {
-        recreate_swapchain();
-    }
-
-    const vk::Image swapchain_image = swapchain.Image();
-#ifdef ENABLE_MM3D_PRESENTATION
-    const auto timing_acquired=frame->input_timing.id?MM3D::InputLatency::Now():0;
-    if (present_trace.session) present_trace.acquired = MM3D::InterpolationPerformance::Now();
-#endif
-
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    };
-    const vk::CommandBuffer cmdbuf = frame->cmdbuf;
-    cmdbuf.begin(begin_info);
-#ifdef ENABLE_MM3D_PRESENTATION
+void PresentWindow::RecordComposition(vk::CommandBuffer cmdbuf, Frame* frame, bool repeat) {
     if (mm3d_overlay) {
         auto& background = mm3d_background;
         if (background.width != frame->width || background.height != frame->height)
@@ -564,9 +575,136 @@ void PresentWindow::CopyToSwapchain(Frame* frame, bool repeat) {
             .image = destination, .subresourceRange = range};
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
             vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, ready);
+        const bool separate_hud = MM3D::WideView::enabled.load() && frame->host_hud_valid &&
+                                  frame->host_hud_framebuffer;
+        if (separate_hud) {
+            const auto hud_source = repeat ? background.host_hud_image : frame->host_hud_image;
+            const auto hud_destination = repeat ? frame->host_hud_image : background.host_hud_image;
+            const std::array hud_barriers{
+                vk::ImageMemoryBarrier{.srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+                    .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                    .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = hud_source, .subresourceRange = range},
+                vk::ImageMemoryBarrier{.srcAccessMask = vk::AccessFlagBits::eMemoryRead |
+                                                        vk::AccessFlagBits::eMemoryWrite,
+                    .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                    .oldLayout = repeat ? vk::ImageLayout::eTransferSrcOptimal
+                                        : vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = hud_destination, .subresourceRange = range}};
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, hud_barriers);
+            cmdbuf.copyImage(hud_source, vk::ImageLayout::eTransferSrcOptimal,
+                hud_destination, vk::ImageLayout::eTransferDstOptimal,
+                MakeImageCopy(frame->width, frame->height, frame->width, frame->height));
+            auto hud_ready = ready;
+            hud_ready.image = hud_destination;
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, hud_ready);
+        }
         // Host-only work on the final frame, after composition and before swapchain transfer.
-        mm3d_overlay->Draw(cmdbuf, frame->framebuffer, frame->width, frame->height);
+        mm3d_overlay->Draw(cmdbuf, separate_hud ? frame->host_hud_framebuffer : frame->framebuffer,
+                           frame->width, frame->height,
+                           frame->eyes, separate_hud);
     }
+}
+#endif
+
+void PresentWindow::CopyToSwapchain(Frame* frame, bool repeat) {
+#ifdef ENABLE_MM3D_PRESENTATION
+    MM3D::InterpolationPerformance::PresentTrace present_trace;
+    present_trace.session = MM3D::InterpolationPerformance::ActiveSession();
+    if (present_trace.session) {
+        present_trace.owner = reinterpret_cast<std::uintptr_t>(&scheduler);
+        present_trace.started = MM3D::InterpolationPerformance::Now();
+        present_trace.shared_queue = instance.GetPresentQueue() == instance.GetGraphicsQueue();
+    }
+    const auto pacing_now=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto pacing_deadline=midpoint_pacer.Deadline(pacing_now,frame->interpolated_pair && !repeat);
+    if(pacing_deadline>pacing_now) {
+        const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::Pacing};
+        const auto target=std::chrono::steady_clock::time_point{
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::nanoseconds{pacing_deadline})};
+        // OS timer coalescing can overshoot a simple sleep by several ms. Sleep
+        // for the bulk, then yield for at most the final 3 ms (no unbounded spin).
+        const auto coarse=target-std::chrono::milliseconds(3);
+        if(std::chrono::steady_clock::now()<coarse)std::this_thread::sleep_until(coarse);
+        while(std::chrono::steady_clock::now()<target)std::this_thread::yield();
+    }
+    if(frame->input_timing.id) {
+        frame->input_timing.pacing_arrival=pacing_now/1000;
+        frame->input_timing.pacing_deadline=pacing_deadline/1000;
+        frame->input_timing.paired=frame->interpolated_pair && !repeat;
+    }
+    const auto timing_copy=frame->input_timing.id?MM3D::InputLatency::Now():0;
+    if (present_trace.session) present_trace.paced = MM3D::InterpolationPerformance::Now();
+#endif
+    if (ExternalPresent::Active()) [[unlikely]] {
+        PresentExternal(frame, repeat);
+#ifdef ENABLE_MM3D_PRESENTATION
+        if (frame->input_timing.id)
+            MM3D::InputLatency::Presented(frame->input_timing, timing_copy, timing_copy,
+                                          MM3D::InputLatency::Now(), repeat);
+        if (mm3d_overlay) {
+            mm3d_overlay->Presented();
+        }
+#endif
+        return;
+    }
+
+    const auto recreate_swapchain = [&] {
+#ifdef ANDROID
+        {
+            std::unique_lock lock{recreate_surface_mutex};
+            recreate_surface_cv.wait(lock, [this]() { return surface != next_surface; });
+            surface = next_surface;
+        }
+#endif
+        auto& queue_mutex=instance.GetPresentQueue()==instance.GetGraphicsQueue() ?
+            scheduler.submit_mutex : instance.PresentQueueMutex();
+        std::scoped_lock submit_lock{queue_mutex};
+        graphics_queue.waitIdle();
+        swapchain.Create(frame->width, frame->height, surface, low_refresh_rate);
+    };
+
+#ifndef ANDROID
+    const bool use_vsync = Settings::values.use_vsync.GetValue();
+    const bool size_changed =
+        swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
+    const bool vsync_changed = vsync_enabled != use_vsync;
+    if (vsync_changed || size_changed) [[unlikely]] {
+        vsync_enabled = use_vsync;
+        recreate_swapchain();
+    }
+#endif
+
+    {
+        const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::SwapAcquire};
+        while (!swapchain.AcquireNextImage()) {
+            recreate_swapchain();
+        }
+    }
+
+    const vk::Image swapchain_image = swapchain.Image();
+#ifdef ENABLE_MM3D_PRESENTATION
+    const auto timing_acquired=frame->input_timing.id?MM3D::InputLatency::Now():0;
+    if (present_trace.session) present_trace.acquired = MM3D::InterpolationPerformance::Now();
+#endif
+
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    const vk::CommandBuffer cmdbuf = frame->cmdbuf;
+    cmdbuf.begin(begin_info);
+#ifdef ENABLE_MM3D_PRESENTATION
+    RecordComposition(cmdbuf, frame, repeat);
 #endif
 
     const vk::Extent2D extent = swapchain.GetExtent();
@@ -670,6 +808,7 @@ void PresentWindow::CopyToSwapchain(Frame* frame, bool repeat) {
     if (present_trace.session) present_trace.lock_requested = MM3D::InterpolationPerformance::Now();
 #endif
     {
+        std::optional<Common::HitchTrace::Scope> hitch_scope{Common::HitchTrace::Phase::PresentSubmit};
         std::scoped_lock submit_lock{queue_mutex, recreate_surface_mutex};
 #ifdef ENABLE_MM3D_PRESENTATION
         if (present_trace.session) present_trace.locked = MM3D::InterpolationPerformance::Now();
@@ -685,6 +824,7 @@ void PresentWindow::CopyToSwapchain(Frame* frame, bool repeat) {
 #ifdef ENABLE_MM3D_PRESENTATION
         if (present_trace.session) present_trace.submitted = MM3D::InterpolationPerformance::Now();
 #endif
+        hitch_scope.emplace(Common::HitchTrace::Phase::SwapPresent);
         swapchain.Present();
 #ifdef ENABLE_MM3D_PRESENTATION
         if (present_trace.session) present_trace.returned = MM3D::InterpolationPerformance::Now();
@@ -702,6 +842,60 @@ void PresentWindow::CopyToSwapchain(Frame* frame, bool repeat) {
         MM3D::InterpolationPerformance::RecordPresent(present_trace);
     }
 #endif
+}
+
+void PresentWindow::PresentExternal(Frame* frame, bool repeat) {
+    // A repeated frame is composed again while its last copy may be in flight.
+    WaitForExternalReads(frame);
+    const vk::CommandBuffer cmdbuf = frame->cmdbuf;
+    cmdbuf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+#ifdef ENABLE_MM3D_PRESENTATION
+    RecordComposition(cmdbuf, frame, repeat);
+#endif
+    cmdbuf.end();
+
+    static constexpr vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+    const vk::SubmitInfo submit_info = {
+        .waitSemaphoreCount = repeat ? 0u : 1u,
+        .pWaitSemaphores = &frame->render_ready,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1u,
+        .pCommandBuffers = &cmdbuf,
+    };
+    auto& queue_mutex = instance.GetPresentQueue() == instance.GetGraphicsQueue()
+                            ? scheduler.submit_mutex
+                            : instance.PresentQueueMutex();
+    {
+        const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::PresentSubmit};
+        std::scoped_lock submit_lock{queue_mutex};
+        try {
+            graphics_queue.submit(submit_info, frame->present_done);
+        } catch (vk::DeviceLostError& err) {
+            LOG_CRITICAL(Render_Vulkan, "Device lost during present submit: {}", err.what());
+            UNREACHABLE();
+        }
+    }
+    // The presenter reads the image with Metal, outside Vulkan's
+    // synchronization, so the frame must be finished before it is handed over.
+    const vk::Device device = instance.GetDevice();
+    {
+        const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::PresentGpu};
+        (void)device.waitForFences(frame->present_done, true, std::numeric_limits<u64>::max());
+    }
+#ifdef ENABLE_MM3D_PRESENTATION
+    frame->wide_camera.hud_texture =
+        frame->hud_valid ? ExternalPresent::MetalTexture(device, frame->hud_image) : nullptr;
+    frame->wide_camera.hud_width = frame->hud_width;
+    frame->wide_camera.hud_height = frame->hud_height;
+    frame->wide_camera.host_hud_texture = frame->host_hud_valid
+        ? ExternalPresent::MetalTexture(device, frame->host_hud_image) : nullptr;
+    const void* metadata = &frame->wide_camera;
+#else
+    const void* metadata = nullptr;
+#endif
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::Deliver};
+    ExternalPresent::Deliver(ExternalPresent::MetalTexture(device, frame->image), frame->width,
+                             frame->height, frame->eyes, metadata);
 }
 
 vk::RenderPass PresentWindow::CreateRenderpass() {

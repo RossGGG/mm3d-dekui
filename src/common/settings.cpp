@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <string_view>
 #include <utility>
 #include "audio_core/dsp_interface.h"
@@ -79,6 +80,20 @@ Values values = {};
 static bool configuring_global = true;
 bool is_temporary_frame_limit;
 double temporary_frame_limit;
+
+static std::atomic<float> stereo_depth_scale{1.0f};
+
+void SetStereoDepthScale(float scale) {
+    stereo_depth_scale.store(scale);
+}
+
+float Effective3DSlider() {
+    if (values.render_3d.GetValue() == StereoRenderOption::Off &&
+        values.mono_render_option.GetValue() == MonoRenderOption::LeftEye) {
+        return 0.0f;
+    }
+    return values.factor_3d.GetValue() / 100.0f * stereo_depth_scale.load();
+}
 
 void LogSettings() {
     const auto log_setting = [](std::string_view name, const auto& value) {

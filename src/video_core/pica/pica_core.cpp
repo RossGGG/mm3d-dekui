@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/arch.h"
+#include "common/hitch_trace.h"
 #include "common/archives.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
@@ -1049,6 +1050,7 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::Draw};
 #ifdef ENABLE_MM3D_PRESENTATION
     cpu_vertex_replay.Begin(0, primitive_assembler.GetTopology());
 #endif
@@ -1091,6 +1093,7 @@ void PicaCore::DrawImmediate() {
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::Draw};
 #ifdef ENABLE_MM3D_PRESENTATION
     const bool cpu_interpolation = MM3D::CpuInterpolation::Enabled() &&
                                    MM3D::CameraMidpoint::enabled.load();

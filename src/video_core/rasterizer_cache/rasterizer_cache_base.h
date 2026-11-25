@@ -84,6 +84,9 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    /// Flushes and unregisters every surface, so each is recreated on next use.
+    void RecreateAll();
+
     /// Perform hardware accelerated texture copy according to the provided configuration
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config);
 

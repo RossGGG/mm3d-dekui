@@ -43,6 +43,9 @@ public:
     void Generate();
 
 private:
+    /// Whether the shader writes gl_FragDepth (see Profile::vk_vertex_depth).
+    bool WritesDepth() const;
+
     /// Undos the host perspective transformation and applies the PICA one
     void WriteDepth();
 

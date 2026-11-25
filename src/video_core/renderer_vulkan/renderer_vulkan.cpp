@@ -7,6 +7,7 @@
 #endif
 #include "common/assert.h"
 #include "common/file_util.h"
+#include "common/hitch_trace.h"
 #include <fstream>
 #include "common/logging/log.h"
 #include "common/memory_detect.h"
@@ -31,6 +32,8 @@
 #include <vk_mem_alloc.h>
 #ifdef ENABLE_MM3D_PRESENTATION
 #include "mm3d/prompt_layer.h"
+#include "mm3d/wide_view.h"
+#include "video_core/renderer_vulkan/vk_external_present.h"
 #include "mm3d/notebook.h"
 #include "mm3d/widescreen.h"
 #include "mm3d/screen_shrink.h"
@@ -202,7 +205,8 @@ void RendererVulkan::PrepareRendertarget() {
     }
 }
 
-void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout) {
+void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout,
+                                 bool transparent) {
     const auto sampler = present_samplers[!Settings::values.filter_mode.GetValue()];
     const auto present_set = present_heap.Commit();
     for (u32 index = 0; index < screen_infos.size(); index++) {
@@ -211,7 +215,14 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
     }
 
     renderpass_cache.EndRendering();
-    scheduler.Record([this, layout, frame, present_set,
+    auto background = clear_color;
+    if (transparent) {
+        for (auto& channel : background.float32) channel = 0.f;
+    }
+    const auto framebuffer = frame->framebuffer;
+    const auto frame_width = frame->width;
+    const auto frame_height = frame->height;
+    scheduler.Record([this, layout, framebuffer, frame_width, frame_height, present_set, background,
                       renderpass = main_present_window.Renderpass(),
                       index = current_pipeline](vk::CommandBuffer cmdbuf) {
         const vk::Viewport viewport = {
@@ -231,15 +242,15 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
         cmdbuf.setViewport(0, viewport);
         cmdbuf.setScissor(0, scissor);
 
-        const vk::ClearValue clear{.color = clear_color};
+        const vk::ClearValue clear{.color = background};
         const vk::PipelineLayout layout{*present_pipeline_layout};
         const vk::RenderPassBeginInfo renderpass_begin_info = {
             .renderPass = renderpass,
-            .framebuffer = frame->framebuffer,
+            .framebuffer = framebuffer,
             .renderArea =
                 vk::Rect2D{
                     .offset = {0, 0},
-                    .extent = {frame->width, frame->height},
+                    .extent = {frame_width, frame_height},
                 },
             .clearValueCount = 1,
             .pClearValues = &clear,
@@ -262,7 +273,8 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
     const bool enabled=MM3D::CameraMidpoint::present_60.load() &&
         MM3D::CameraMidpoint::enabled.load() && !secondaryWindowEnabled &&
         layout.top_screen_enabled && layout.is_rotated &&
-        layout.render_3d_mode==Settings::StereoRenderOption::Off &&
+        (layout.render_3d_mode==Settings::StereoRenderOption::Off ||
+         layout.render_3d_mode==Settings::StereoRenderOption::SideBySideFull) &&
         !layout.additional_screen_enabled && Settings::values.use_vsync.GetValue();
     midpoint_async_skip = enabled;
     if(midpoint_present_generation!=MM3D::CameraMidpoint::generation.load()) {
@@ -351,6 +363,22 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
             scheduler.Finish();
             window.RecreateFrame(frame, layout.width, layout.height);
         }
+        frame->eyes = layout.render_3d_mode == Settings::StereoRenderOption::SideBySideFull ? 2 : 1;
+#ifdef ENABLE_MM3D_PRESENTATION
+        frame->wide_camera = MM3D::WideView::enabled.load()
+                                 ? MM3D::WideView::Presented(midpoint_presenting)
+                                 : MM3D::WideView::Camera{};
+        frame->wide_camera.no_world = MM3D::WideView::enabled.load() &&
+            MM3D::WideView::menu.load();
+        {
+            static bool menu_logged = false;
+            if (frame->wide_camera.no_world != menu_logged) {
+                menu_logged = frame->wide_camera.no_world;
+                LOG_INFO(Render_Vulkan, "Wide view menu: {} at frame {}", menu_logged,
+                         MM3D::guest_frames.load());
+            }
+        }
+#endif
 
         clear_color.float32[0] = Settings::values.bg_red.GetValue();
         clear_color.float32[1] = Settings::values.bg_green.GetValue();
@@ -362,6 +390,13 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
         MM3D::InterpolationPerformance::Scope timing{MM3D::InterpolationPerformance::Part::Compose};
 #endif
         DrawScreens(frame, layout, flipped);
+#ifdef ENABLE_MM3D_PRESENTATION
+        frame->host_hud_valid = false;
+        if (MM3D::WideView::enabled.load() && frame->host_hud_framebuffer) {
+            DrawScreens(frame, layout, flipped, true);
+            frame->host_hud_valid = true;
+        }
+#endif
         }
 #ifdef ENABLE_MM3D_PRESENTATION
         if(capture_pair)CaptureMidpointFrame(frame,FileUtil::GetUserPath(FileUtil::UserPath::LogDir)+
@@ -371,6 +406,9 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
         scheduler.SetPerformancePhase(static_cast<unsigned>(midpoint_presenting ?
             MM3D::InterpolationPerformance::Part::MidpointPass :
             MM3D::InterpolationPerformance::Part::NativePass));
+#endif
+#ifdef ENABLE_MM3D_PRESENTATION
+        CopyWideHud(*frame);
 #endif
         scheduler.Flush(frame->render_ready);
         {
@@ -389,6 +427,113 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
         }
     }
 }
+
+#ifdef ENABLE_MM3D_PRESENTATION
+void RendererVulkan::CopyWideHud(Frame& frame) {
+    frame.hud_valid = false;
+    if (!MM3D::WideView::enabled.load() || !instance.HasMetalObjects()) {
+        return;
+    }
+    const auto& layers = rasterizer.PromptOverlays();
+    const auto found = layers.find(MM3D::WideView::HudLayerId);
+    if (found == layers.end() || !found->second || !found->second->Visible()) {
+        return;
+    }
+    const auto& layer = *found->second;
+    const s32 width = layer.viewport_width, height = layer.viewport_height;
+    if (width <= 0 || height <= 0 || layer.x < 0 || layer.y < 0 ||
+        u32(layer.x + width) > layer.Width() || u32(layer.y + height) > layer.Height()) {
+        return;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (frame.hud_image && (frame.hud_width != u32(width) || frame.hud_height != u32(height))) {
+        scheduler.Finish();
+        vmaDestroyImage(instance.GetAllocator(), frame.hud_image, frame.hud_allocation);
+        frame.hud_image = vk::Image{};
+    }
+    if (!frame.hud_image) {
+        VkImageCreateInfo image_info = static_cast<VkImageCreateInfo>(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .extent = {u32(width), u32(height), 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+                     vk::ImageUsageFlagBits::eSampled,
+        });
+        image_info.pNext = ExternalPresent::ExportCreateInfo();
+        const VmaAllocationCreateInfo alloc_info = {
+            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        };
+        VkImage image{};
+        if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &image,
+                           &frame.hud_allocation, nullptr) != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Wide view: could not create the HUD image {}x{}", width,
+                      height);
+            return;
+        }
+        frame.hud_image = vk::Image{image};
+        frame.hud_width = u32(width);
+        frame.hud_height = u32(height);
+        frame.hud_initialized = false;
+    }
+    renderpass_cache.EndRendering();
+    const vk::Image source = layer.Image(), target = frame.hud_image;
+    const bool initialized = frame.hud_initialized;
+    const s32 x = layer.x, y = layer.y;
+    scheduler.Record([=](vk::CommandBuffer cmd) {
+        constexpr vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        const std::array barriers{
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite |
+                                 vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = source,
+                .subresourceRange = range,
+            },
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eNone,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .oldLayout = initialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = target,
+                .subresourceRange = range,
+            },
+        };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                            vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+                            {}, {}, barriers);
+        const vk::ImageCopy region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffset = {x, y, 0},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffset = {0, 0, 0},
+            .extent = {u32(width), u32(height), 1},
+        };
+        cmd.copyImage(source, vk::ImageLayout::eGeneral, target, vk::ImageLayout::eGeneral, region);
+        // The layer is cleared and redrawn for the next guest frame after this read.
+        const vk::MemoryBarrier after{
+            .srcAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferWrite |
+                             vk::AccessFlagBits::eColorAttachmentWrite |
+                             vk::AccessFlagBits::eMemoryRead,
+        };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eAllCommands,
+                            vk::DependencyFlagBits::eByRegion, after, {}, {});
+    });
+    frame.hud_initialized = true;
+    frame.hud_valid = true;
+}
+#endif
 
 void RendererVulkan::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuffer,
                                         ScreenInfo& screen_info, bool right_eye) {
@@ -1048,14 +1193,26 @@ void RendererVulkan::ApplySecondLayerOpacity(float alpha) {
 }
 
 #ifdef ENABLE_MM3D_PRESENTATION
-void RendererVulkan::DrawMidpointTop(const Common::Rectangle<u32>& top) {
+void RendererVulkan::DrawMidpointTop(const Layout::FramebufferLayout& layout,
+                                     const Common::Rectangle<u32>& top) {
     const auto saved_coords=screen_infos[2].texcoords;
+    // Side-by-side stereo draws each eye's midpoint into its half, as
+    // DrawTopScreen does for native frames.
+    const bool stereo=layout.render_3d_mode==Settings::StereoRenderOption::SideBySideFull;
+    for(unsigned side=0;side<(stereo?2u:1u);++side) {
+    const unsigned eye=Settings::values.swap_eyes_3d.GetValue()?1-side:side;
+    const float left=float(top.left)+(side?layout.width/2.f:0.f);
+    draw_info.layer=side;
     // HUD replay includes covers/bars in guest submission order. The separate
     // fade target is only for the diagnostic inset, not paired presentation.
     for(const auto id : {"@camera_midpoint","@camera_midpoint_hud"}) {
+        // Without a right-eye capture in this frame, both eyes show the left.
+        const MM3D::PromptLayer* right=eye==1?rasterizer.MidpointRightEyeLayer(id):nullptr;
         const auto found=rasterizer.PromptOverlays().find(id);
-        if(found==rasterizer.PromptOverlays().end() || !found->second->Visible())continue;
-        const auto& layer=*found->second;
+        const MM3D::PromptLayer* chosen=right?right:
+            found!=rasterizer.PromptOverlays().end()?found->second.get():nullptr;
+        if(!chosen || !chosen->Visible())continue;
+        const auto& layer=*chosen;
         const auto set=present_heap.Commit();
         for(u32 i=0;i<3;++i)update_queue.AddImageSampler(set,0,i,layer.View(),present_samplers[0]);
         const auto pipeline=std::string_view(id)=="@camera_midpoint"?midpoint_pipeline:prompt_pipeline;
@@ -1066,8 +1223,9 @@ void RendererVulkan::DrawMidpointTop(const Common::Rectangle<u32>& top) {
         screen_infos[2].texcoords={
             float(layer.y+layer.viewport_height)/layer.Height(),float(layer.x)/layer.Width(),
             float(layer.y)/layer.Height(),float(layer.x+layer.viewport_width)/layer.Width()};
-        DrawSingleScreen(2,top.left,top.top,top.GetWidth(),top.GetHeight(),
+        DrawSingleScreen(2,left,top.top,top.GetWidth(),top.GetHeight(),
                          Layout::DisplayOrientation::Landscape,1.f);
+    }
     }
     screen_infos[2].texcoords=saved_coords;
     // Restore native screen bindings before bottom-screen/UI composition.
@@ -1091,7 +1249,7 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     leftside = Settings::values.swap_eyes_3d.GetValue() ? 1 : 0;
     rightside = Settings::values.swap_eyes_3d.GetValue() ? 0 : 1;
 #ifdef ENABLE_MM3D_PRESENTATION
-    if(midpoint_presenting) { DrawMidpointTop(top_screen);return; }
+    if(midpoint_presenting) { DrawMidpointTop(layout,top_screen);return; }
 #endif
     const float top_screen_left = static_cast<float>(top_screen.left);
     const float top_screen_top = static_cast<float>(top_screen.top);
@@ -1202,19 +1360,22 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
 }
 
 void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& source_layout,
-                                 bool flipped) {
+                                 bool flipped, bool host_hud_only) {
     auto layout=source_layout;
 #ifdef ENABLE_MM3D_PRESENTATION
     // Private replay attachments become shader inputs only at composition.
     // This must precede PrepareDraw, outside the presentation render pass.
     for(const auto& [id,layer]:rasterizer.PromptOverlays())
         if(layer && layer->Visible())layer->PrepareForSampling();
+    // Side-by-side stereo composes each eye in its own half; the right eye is
+    // drawn at the same rectangle offset by half the width.
+    const bool stereo_full=layout.render_3d_mode==Settings::StereoRenderOption::SideBySideFull;
     const bool wide_supported=layout.top_screen_enabled && layout.is_rotated &&
-        layout.render_3d_mode==Settings::StereoRenderOption::Off;
+        (layout.render_3d_mode==Settings::StereoRenderOption::Off || stereo_full);
     MM3D::Widescreen::supported_layout.store(wide_supported);
     if(MM3D::Widescreen::Active())
         layout.top_screen=MM3D::Widescreen::FitTop(layout.top_screen,layout.bottom_screen,
-            layout.width,layout.bottom_screen_enabled);
+            stereo_full?layout.width/2:layout.width,layout.bottom_screen_enabled);
     if(wide_supported&&MM3D::ScreenShrink::native_normalized.load())
         layout.top_screen=MM3D::ScreenShrink::Bounds(layout.top_screen,
             MM3D::ScreenShrink::presentation_scale.load());
@@ -1228,7 +1389,14 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         ReloadPipeline(layout.render_3d_mode);
     }
 
-    PrepareDraw(frame, layout);
+    Frame host_target{};
+    if (host_hud_only) {
+        host_target.width = frame->width;
+        host_target.height = frame->height;
+        host_target.framebuffer = frame->host_hud_framebuffer;
+        frame = &host_target;
+    }
+    PrepareDraw(frame, layout, host_hud_only);
 
     const auto& top_screen = layout.top_screen;
     const auto& bottom_screen = layout.bottom_screen;
@@ -1239,14 +1407,14 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
     // Apply the initial default opacity value; Needed to avoid flickering
     ApplySecondLayerOpacity(1.0f);
 
-    if (!Settings::values.swap_screen.GetValue()) {
+    if (!host_hud_only && !Settings::values.swap_screen.GetValue()) {
         DrawTopScreen(layout, top_screen);
         draw_info.layer = 0;
         if (layout.bottom_opacity < 1) {
             ApplySecondLayerOpacity(layout.bottom_opacity);
         }
         DrawBottomScreen(layout, bottom_screen);
-    } else {
+    } else if (!host_hud_only) {
         DrawBottomScreen(layout, bottom_screen);
         draw_info.layer = 0;
         if (layout.top_opacity < 1) {
@@ -1255,7 +1423,7 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         DrawTopScreen(layout, top_screen);
     }
 
-    if (layout.additional_screen_enabled) {
+    if (!host_hud_only && layout.additional_screen_enabled) {
         const auto& additional_screen = layout.additional_screen;
         if (!layout.additional_screen_is_bottom) {
             DrawTopScreen(layout, additional_screen);
@@ -1266,8 +1434,29 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
 
 #ifdef ENABLE_MM3D_PRESENTATION
     const bool notebook_visible = MM3D::Profiles::NotebookDetectedThisFrame();
-    if (notebook_visible && MM3D::Notebook::detail_preview.load() && !MM3D::Notebook::transparent_copy.load() && layout.top_screen_enabled &&
-        layout.is_rotated && layout.render_3d_mode == Settings::StereoRenderOption::Off) {
+    // Overlays stand in for the lower screen. With side-by-side stereo they are
+    // drawn into each eye's half at the same place, so they sit at screen depth.
+    const bool overlay_stereo = layout.render_3d_mode == Settings::StereoRenderOption::SideBySideFull;
+    const bool overlay_layout = layout.render_3d_mode == Settings::StereoRenderOption::Off || overlay_stereo;
+    const unsigned overlay_eyes = overlay_stereo ? 2u : 1u;
+    const auto eye_top_screen = [&](unsigned side) {
+        auto rect = layout.top_screen;
+        if (side) {
+            rect.left += layout.width / 2;
+            rect.right += layout.width / 2;
+        }
+        return rect;
+    };
+    // Right edge of the eye's half, which overlays must not cross.
+    const auto eye_right_limit = [&](unsigned side) {
+        return overlay_stereo ? (side + 1) * (layout.width / 2) : layout.width;
+    };
+    if (notebook_visible && MM3D::Notebook::detail_preview.load() && !MM3D::Notebook::transparent_copy.load() &&
+        (!MM3D::WideView::enabled.load() || host_hud_only) && layout.top_screen_enabled &&
+        layout.is_rotated && overlay_layout) {
+      for (unsigned side = 0; side < overlay_eyes; ++side) {
+        const auto top_screen = eye_top_screen(side);
+        const u32 right_limit = eye_right_limit(side);
         // Sample the actual composed lower framebuffer. Existing screen texcoords
         // handle the 3DS rotation/transfer; scissor selects the textbox region.
         const float width = top_screen.GetWidth() * MM3D::Notebook::detail_scale.load();
@@ -1276,8 +1465,8 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         const int source_bottom = std::clamp(MM3D::Notebook::detail_bottom.load(), source_top+1, 240);
         const float x = top_screen.left + top_screen.GetWidth() * MM3D::Notebook::detail_x.load();
         const float y = top_screen.top + top_screen.GetHeight() * MM3D::Notebook::detail_y.load();
-        const s32 left = std::clamp<s32>(x, top_screen.left, std::min(top_screen.right,layout.width));
-        const s32 right = std::clamp<s32>(x + width, left, std::min(top_screen.right, layout.width));
+        const s32 left = std::clamp<s32>(x, top_screen.left, std::min(top_screen.right,right_limit));
+        const s32 right = std::clamp<s32>(x + width, left, std::min(top_screen.right, right_limit));
         const s32 top = std::clamp<s32>(y, top_screen.top, std::min(top_screen.bottom,layout.height));
         const s32 bottom = std::clamp<s32>(y + (source_bottom-source_top)*pixels, top,
                                           std::min(top_screen.bottom, layout.height));
@@ -1292,10 +1481,13 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
                 cmd.setScissor(0, vk::Rect2D{{0,0},{layout.width,layout.height}});
             });
         }
+      }
     }
     for (const auto& [id,layer] : rasterizer.PromptOverlays()) {
     auto* prompt = layer.get();
     if(id=="@camera_midpoint_hud")continue;
+    // The wide view's HUD goes to the presenter on its own (CopyWideHud).
+    if(id==MM3D::WideView::HudLayerId)continue;
     if(MM3D::CameraMidpoint::present_60.load() &&
        (id=="@camera_midpoint" || id=="@camera_midpoint_fade"))continue;
     const bool minimap=id=="@minimap";
@@ -1305,11 +1497,17 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
     const bool camera_visible=!camera_fade ||
         (scene!=rasterizer.PromptOverlays().end() && scene->second->Visible());
     const bool panel_copy = id == "@notebook_panel";
+    const bool late_hud = !camera_layer;
+    if (MM3D::WideView::enabled.load() && host_hud_only != late_hud) continue;
+    if (!MM3D::WideView::enabled.load() && host_hud_only) continue;
     const bool layer_enabled = camera_layer ? MM3D::CameraMidpoint::enabled.load() && camera_visible : minimap ? MM3D::Minimap::LegacyCopy && MM3D::Minimap::enabled.load() && MM3D::Minimap::marker_seen : panel_copy ? notebook_visible && MM3D::Notebook::detail_preview.load() &&
         MM3D::Notebook::transparent_copy.load() : MM3D::Profiles::Active(id) &&
         (!prompt->profile.panel_copy || MM3D::Profiles::ContextDetectedThisFrame(prompt->profile.required_context));
     if (prompt && prompt->Visible() && layer_enabled && layout.top_screen_enabled &&
-        layout.render_3d_mode == Settings::StereoRenderOption::Off && layout.is_rotated) {
+        overlay_layout && layout.is_rotated) {
+      for (unsigned side = 0; side < overlay_eyes; ++side) {
+        const auto top_screen = eye_top_screen(side);
+        const u32 right_limit = eye_right_limit(side);
         const auto set = present_heap.Commit();
         for (u32 i = 0; i < 3; ++i)
             update_queue.AddImageSampler(set, 0, i, prompt->View(), present_samplers[0]);
@@ -1375,12 +1573,17 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         if(minimap) {
             height=top_screen.GetHeight()*std::clamp(MM3D::Minimap::scale.load(),.2f,.6f);
             width=height*(320.f/240.f);
-            const float margin=top_screen.GetHeight()*.025f;
-            x=top_screen.right-margin-width;
-            y=top_screen.bottom-margin-height;
+            // The host HUD texture spans the immersive framebuffer, whose
+            // outer edge is well beyond the compact HUD's comfortable view.
+            // Keep the replacement map inside that HUD-safe area.
+            const float margin_x=host_hud_only ? top_screen.GetWidth()*.10f
+                                               : top_screen.GetHeight()*.025f;
+            const float margin_y=top_screen.GetHeight()*(host_hud_only ? .10f : .025f);
+            x=top_screen.right-margin_x-width;
+            y=top_screen.bottom-margin_y-height;
         }
-        const s32 left = std::clamp<s32>(x+width*cu0,top_screen.left,std::min(top_screen.right,layout.width));
-        const s32 right = std::clamp<s32>(x+width*cu1,left,std::min(top_screen.right,layout.width));
+        const s32 left = std::clamp<s32>(x+width*cu0,top_screen.left,std::min(top_screen.right,right_limit));
+        const s32 right = std::clamp<s32>(x+width*cu1,left,std::min(top_screen.right,right_limit));
         const s32 top = std::clamp<s32>(y+height*cv0,top_screen.top,std::min(top_screen.bottom,layout.height));
         const s32 bottom = std::clamp<s32>(y+height*cv1,top,std::min(top_screen.bottom,layout.height));
         const vk::Rect2D crop_scissor{{left,top},{u32(right-left),u32(bottom-top)}};
@@ -1392,10 +1595,11 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
             cmd.setScissor(0, vk::Rect2D{{0, 0}, {layout.width, layout.height}});
         });
         screen_infos[2].texcoords = saved_coords;
+      }
     }
     }
 #endif
-    DrawCursor(layout);
+    if (!MM3D::WideView::enabled.load() || host_hud_only) DrawCursor(layout);
 
     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRenderPass(); });
 }
@@ -1515,6 +1719,7 @@ void RendererVulkan::SwapBuffers() {
     }
 #endif
     if (!screenRendered) {
+        const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::PresentFinish};
 #ifdef ENABLE_MM3D_PRESENTATION
         // Native fallback can skip a duplicate while the previous interpolated
         // scene is still executing. Draining it here serializes emulation with

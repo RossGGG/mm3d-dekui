@@ -108,6 +108,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .has_logic_op = !instance.NeedsLogicOpEmulation(),
         .vk_disable_spirv_optimizer = Settings::values.disable_spirv_optimizer.GetValue(),
         .vk_use_spirv_generator = Settings::values.spirv_shader_gen.GetValue(),
+        .vk_vertex_depth = instance.UseVertexDepth(),
         .is_vulkan = true,
     };
 
@@ -377,7 +378,12 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
     }
 
     GraphicsPipeline* const pipeline = curr_disk_cache->GetPipeline(info);
-    if (!pipeline->IsDone() && !pipeline->TryBuild(wait_built)) {
+    // MoltenVK ignores FAIL_ON_PIPELINE_COMPILE_REQUIRED and compiles the Metal
+    // pipeline inline, stalling the frame for 100+ ms. Pipelines first seen
+    // mid-game are never in the driver cache (the disk cache prebuilt the rest),
+    // so on MoltenVK send them straight to the workers.
+    const bool try_driver_cache = instance.GetDriverID() != vk::DriverId::eMoltenvk;
+    if (!pipeline->IsDone() && !pipeline->TryBuild(wait_built, try_driver_cache)) {
         return false;
     }
 

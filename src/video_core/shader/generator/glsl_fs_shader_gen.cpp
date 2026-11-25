@@ -183,7 +183,9 @@ vec4 secondary_fragment_color = vec4(0.0);
     if (config.framebuffer.shadow_rendering) {
         WriteShadow();
     } else {
-        out += "gl_FragDepth = depth;\n";
+        if (WritesDepth()) {
+            out += "gl_FragDepth = depth;\n";
+        }
         // Round the final fragment color to maintain the PICA's 8 bits of precision
         out += "combiner_output = byteround(combiner_output);\n";
         WriteBlending();
@@ -196,7 +198,17 @@ vec4 secondary_fragment_color = vec4(0.0);
     return out;
 }
 
+bool FragmentModule::WritesDepth() const {
+    // Profile::vk_vertex_depth moves the mapping into clip z, except for W-buffering.
+    return !profile.vk_vertex_depth ||
+           config.framebuffer.depthmap_enable == RasterizerRegs::DepthBuffering::WBuffering;
+}
+
 void FragmentModule::WriteDepth() {
+    if (!WritesDepth()) {
+        out += "float depth = gl_FragCoord.z;\n";
+        return;
+    }
     // The PICA depth range is [-1, 0]. The vertex shader outputs the negated Z value, otherwise
     // unmodified. When the depth range is [-1, 1], it is converted into [near, far] = [0, 1].
     // This compresses our effective range into [0.5, 1]. To account for this we un-negate the value

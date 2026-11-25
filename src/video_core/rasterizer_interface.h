@@ -85,6 +85,10 @@ public:
 
     virtual void SwitchDiskResources([[maybe_unused]] u64 title_id) {}
 
+    /// Writes caches that are otherwise only saved at shutdown, for platforms
+    /// that may end the app without one.
+    virtual void SaveDiskResources() {}
+
     static void SetSwitchDiskResourcesCallback(const DiskResourceLoadCallback& callback) {
         switch_disk_resources_callback = callback;
     }

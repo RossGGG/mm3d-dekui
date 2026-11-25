@@ -109,6 +109,18 @@ class TextureRuntime {
     friend class Surface;
 
 public:
+    /// Whether every RGBA8 surface gets storage usage (with an R32Uint view
+    /// format) in case it becomes a shadow target. Both cost the surface Metal's
+    /// lossless compression, so it starts off: surfaces get them only when
+    /// created as shadow sources. The first shadow draw or D24S8 -> RGBA8
+    /// reinterpretation requests it (RequestRGBA8Storage returns true the first
+    /// time); the rasterizer then turns it on and recreates every surface at the
+    /// end of the frame. DEKUI_RGBA8_STORAGE=1 starts with it on.
+    static bool RGBA8Storage();
+    static void EnableRGBA8Storage();
+    static bool RequestRGBA8Storage();
+    static bool RGBA8StorageRequested();
+
     explicit TextureRuntime(const Instance& instance, Scheduler& scheduler,
                             RenderManager& renderpass_cache, DescriptorUpdateQueue& update_queue,
                             u32 num_swapchain_images);

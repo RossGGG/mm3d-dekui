@@ -311,6 +311,12 @@ private:
 
     bool RecreateCache(CacheFile& file, CacheFileType type);
 
+    /// Merges caches copied from another device into shaders/import/ (for
+    /// example a shader tour run on a Mac) into this device's cache files.
+    void ImportCaches();
+    bool MergeImported(CacheFileType type, const std::string& import_path,
+                       const std::string& cache_path);
+
     bool InitVSCache(const std::atomic_bool& stop_loading,
                      const VideoCore::DiskResourceLoadCallback& callback);
 

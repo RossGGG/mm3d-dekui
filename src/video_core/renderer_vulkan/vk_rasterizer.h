@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
+#include "video_core/renderer_vulkan/vk_simulator_workarounds.h"
 #include "video_core/renderer_vulkan/vk_stream_buffer.h"
 #include "video_core/renderer_vulkan/vk_texture_runtime.h"
 
@@ -71,14 +72,17 @@ public:
     const auto& PromptOverlays() const { return prompt_layers; }
     MM3D::CameraMidpoint::PresentationStatus MidpointStatus(u64 completed) const {
         using namespace MM3D::CameraMidpoint;
-        if(!midpoint_target_frame)return PresentationStatus::WaitingScene;
-        if(!IsCompletedCapture(midpoint_target_frame,completed))return PresentationStatus::FrameMismatch;
-        if(!midpoint_frame_interpolated)return PresentationStatus::NoMidpoint;
-        if(midpoint_hud_frame!=midpoint_target_frame)return PresentationStatus::NoHud;
-        if(midpoint_hud_failed || midpoint_scene_clear.Pending(*midpoint_target_frame))
-            return PresentationStatus::UnsupportedHud;
-        return PresentationStatus::Active;
+        const auto status=EyeStatus(completed,midpoint_target_frame,midpoint_frame_interpolated,
+            midpoint_hud_frame,midpoint_hud_failed,midpoint_scene_clear);
+        // A right eye captured in the same frame must be ready too.
+        if(status!=PresentationStatus::Active || !RightEyeCaptured())return status;
+        const auto& r=midpoint_other_eye;
+        return EyeStatus(completed,r.target_frame,r.frame_interpolated,r.hud_frame,r.hud_failed,
+            r.scene_clear);
     }
+    /// The right eye's midpoint layer ("@camera_midpoint" or "@camera_midpoint_hud")
+    /// when the right eye was captured in the same frame as the left; else null.
+    const MM3D::PromptLayer* MidpointRightEyeLayer(std::string_view id) const;
     std::optional<u32> ReadVisibilityDepth(u32 address, const MM3D::VisibilityDepth::Context& context) override;
     void ResetVisibilityDepth() override;
     void CapturePause(u32 source,unsigned eye) override;
@@ -103,6 +107,7 @@ public:
 
     /// Switches the disk resources to the specified title
     void SwitchDiskResources(u64 title_id) override;
+    void SaveDiskResources() override;
 
 private:
 #ifdef ENABLE_MM3D_PRESENTATION
@@ -149,6 +154,58 @@ private:
     MM3D::CameraMidpoint::SceneCopies midpoint_scene_copies;
     MM3D::CameraMidpoint::SceneClearPair midpoint_scene_clear;
     s64 midpoint_last_draw_ms{};
+
+    // Side-by-side stereo: the game draws the left eye, copies it to the left
+    // display buffer, then draws the right eye into the same target. The
+    // midpoint members above belong to the eye being drawn; the other eye's
+    // are kept here and swapped in when the eye changes (SetMidpointEye).
+    static constexpr std::array<const char*,3> MidpointLayerIds{
+        "@camera_midpoint","@camera_midpoint_fade","@camera_midpoint_hud"};
+    struct MidpointEyeState {
+        MM3D::CameraMidpoint::History history;
+        MM3D::ForestParticleInterpolation::History forest_particle_history;
+        MM3D::LinkInterpolation::History link_history;
+        MM3D::SongEffectInterpolation::History song_history;
+        std::optional<MM3D::SongEffectInterpolation::Values> song_overrides;
+        MM3D::LinkInterpolation::Overrides link_overrides{};
+        std::vector<MM3D::LinkPoseCapture::LivePose> link_poses;
+        std::optional<u64> link_frame;
+        unsigned link_generation{};
+        unsigned generation{};
+        unsigned width{}, height{};
+        std::optional<u64> target_frame, fade_frame, hud_frame, title_depth_frame;
+        std::optional<u64> world_frame, opaque_world_frame, stencil_frame;
+        bool hud_failed{}, frame_interpolated{};
+        MM3D::GlareInterpolation glare_history;
+        MM3D::RippleInterpolation::History ripple_history;
+        MM3D::SplashInterpolation::History splash_history;
+        MM3D::CameraMidpoint::SceneClearPair scene_clear;
+        s64 last_draw_ms{};
+        std::array<std::unique_ptr<MM3D::PromptLayer>,MidpointLayerIds.size()> layers;
+    };
+    MidpointEyeState midpoint_other_eye;
+    unsigned midpoint_eye{};
+    void SetMidpointEye(unsigned eye);
+    void SwapMidpointEye();
+    /// Clears the inactive eye's midpoint state, keeping its layers hidden.
+    void ResetMidpointOtherEye();
+    bool RightEyeCaptured() const {
+        return midpoint_eye==0 && midpoint_other_eye.target_frame &&
+            midpoint_other_eye.target_frame==midpoint_target_frame;
+    }
+    static MM3D::CameraMidpoint::PresentationStatus EyeStatus(u64 completed,
+        const std::optional<u64>& target_frame, bool frame_interpolated,
+        const std::optional<u64>& hud_frame, bool hud_failed,
+        const MM3D::CameraMidpoint::SceneClearPair& scene_clear) {
+        using namespace MM3D::CameraMidpoint;
+        if(!target_frame)return PresentationStatus::WaitingScene;
+        if(!IsCompletedCapture(target_frame,completed))return PresentationStatus::FrameMismatch;
+        if(!frame_interpolated)return PresentationStatus::NoMidpoint;
+        if(hud_frame!=target_frame)return PresentationStatus::NoHud;
+        if(hud_failed || scene_clear.Pending(*target_frame))
+            return PresentationStatus::UnsupportedHud;
+        return PresentationStatus::Active;
+    }
 #endif
     /// Syncs pipeline state from PICA registers
     void SyncDrawState();
@@ -226,6 +283,10 @@ private:
     StreamBuffer uniform_buffer;    ///< Uniform buffer
     StreamBuffer texture_buffer;    ///< Texture buffer
     StreamBuffer texture_lf_buffer; ///< Texture Light-Fog buffer
+#ifdef CITRA_PRIVATE_TEXEL_BUFFERS
+    PrivateTexelBuffer texture_private;    ///< What draws read in the simulator
+    PrivateTexelBuffer texture_lf_private; ///< What draws read in the simulator
+#endif
     vk::UniqueBufferView texture_lf_view;
     vk::UniqueBufferView texture_rg_view;
     vk::UniqueBufferView texture_rgba_view;

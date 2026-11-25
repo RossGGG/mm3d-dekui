@@ -2,6 +2,10 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
 #include "common/common_paths.h"
 #include "common/file_util.h"
 #include "common/scm_rev.h"
@@ -66,6 +70,8 @@ void ShaderDiskCache::Init(const std::atomic_bool& stop_loading,
         return;
 
     auto new_callback = MakeThrottledCallback(callback);
+
+    ImportCaches();
 
     if (!stop_loading && !InitVSCache(stop_loading, new_callback)) {
         RecreateCache(vs_cache, CacheFileType::VS_CACHE);
@@ -248,6 +254,12 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
 
     auto [it, new_pipeline] = graphics_pipelines.try_emplace(optimized_hash);
     if (new_pipeline) {
+        // The disk cache builds every pipeline it knows at startup, so a pipeline
+        // created here has to compile mid-game. The hitch trace shows its cost.
+        LOG_INFO(Render_Vulkan, "Hitch trace: building pipeline {:016X} (optimized {:016X}), {}",
+                 hash, optimized_hash,
+                 known_graphic_pipelines.contains(hash) ? "known to the disk cache but not prebuilt"
+                                                        : "never seen before");
         if (!parent.instance.UseGeometryShaders() ||
             parent.instance.IsFragmentShaderBarycentricSupported()) {
             // If we don't need geometry shaders disable
@@ -572,12 +584,174 @@ bool ShaderDiskCache::RecreateCache(CacheFile& file, CacheFileType type) {
     return true;
 }
 
+void ShaderDiskCache::ImportCaches() {
+    const std::string import_dir =
+        FileUtil::GetUserPath(FileUtil::UserPath::ShaderDir) + "import" + DIR_SEP;
+    if (!FileUtil::IsDirectory(import_dir)) {
+        return;
+    }
+    const std::array<std::pair<CacheFileType, std::string>, 4> files{{
+        {CacheFileType::VS_CACHE, GetVSFile(title_id, false)},
+        {CacheFileType::FS_CACHE, GetFSFile(title_id, false)},
+        {CacheFileType::GS_CACHE, GetGSFile(title_id, false)},
+        {CacheFileType::PL_CACHE, GetPLFile(title_id, false)},
+    }};
+    for (const auto& [type, cache_path] : files) {
+        const std::string name = cache_path.substr(cache_path.find_last_of("/\\") + 1);
+        const std::string import_path = import_dir + name;
+        if (!FileUtil::Exists(import_path)) {
+            continue;
+        }
+        if (MergeImported(type, import_path, cache_path)) {
+            FileUtil::Delete(import_path);
+        }
+    }
+}
+
+bool ShaderDiskCache::MergeImported(CacheFileType type, const std::string& import_path,
+                                    const std::string& cache_path) {
+    using Header = CacheEntry::CacheEntryHeader;
+    using Footer = CacheEntry::CacheEntryFooter;
+    constexpr size_t headers_size = sizeof(Header) + sizeof(Footer);
+
+    struct Entry {
+        Header header;
+        std::span<const u8> payload; // header and footer excluded
+    };
+    // Splits a cache file into its entries; empty if the file is not a valid
+    // cache of this type and config layout.
+    const auto parse = [&](const std::vector<u8>& data) {
+        std::vector<Entry> out;
+        for (size_t pos = 0; pos + headers_size <= data.size();) {
+            Header header;
+            std::memcpy(&header, data.data() + pos, sizeof(header));
+            if (!header.Valid() || pos + header.entry_size > data.size()) {
+                break; // keep the entries before a torn write
+            }
+            out.push_back({header, std::span<const u8>(data.data() + pos + sizeof(Header),
+                                                       header.entry_size - headers_size)});
+            pos += header.entry_size;
+        }
+        if (out.empty() || out[0].header.Type() != CacheEntryType::FILE_INFO ||
+            out[0].header.zstd_compressed || out[0].payload.size() != sizeof(FileInfoEntry)) {
+            return std::vector<Entry>{};
+        }
+        const auto& info = *reinterpret_cast<const FileInfoEntry*>(out[0].payload.data());
+        const u64 struct_hash = type == CacheFileType::VS_CACHE ? PicaVSConfigState::StructHash()
+                                : type == CacheFileType::FS_CACHE ? FSConfig::StructHash()
+                                : type == CacheFileType::GS_CACHE
+                                    ? PicaGSConfigState::StructHash()
+                                    : StaticPipelineInfo::StructHash();
+        if (info.cache_magic != FileInfoEntry::CACHE_FILE_MAGIC ||
+            info.file_version != FileInfoEntry::CACHE_FILE_VERSION || info.file_type != type ||
+            info.config_struct_hash != struct_hash) {
+            return std::vector<Entry>{};
+        }
+        return out;
+    };
+    const auto read = [](const std::string& path) {
+        std::vector<u8> data;
+        FileUtil::IOFile file(path, "rb");
+        if (file.IsOpen()) {
+            data.resize(file.GetSize());
+            if (file.ReadBytes(data.data(), data.size()) != data.size()) {
+                data.clear();
+            }
+        }
+        return data;
+    };
+
+    const std::vector<u8> imported_data = read(import_path);
+    const std::vector<u8> own_data = read(cache_path);
+    const auto imported = parse(imported_data);
+    const auto own = parse(own_data);
+    if (imported.empty()) {
+        LOG_ERROR(Render_Vulkan, "Shader cache import: {} is not a usable cache file, skipped",
+                  import_path);
+        return false;
+    }
+
+    // Keep this device's entries and add the new ones. The SPIR-V of the two
+    // may come from different drivers or builds, so clear the source hash in
+    // the header: the next load regenerates all SPIR-V from the configs.
+    const auto& info_source = (own.empty() ? imported : own)[0].payload;
+    std::vector<u8> info_bytes(info_source.begin(), info_source.end());
+    reinterpret_cast<FileInfoEntry*>(info_bytes.data())->source_hash = {};
+
+    std::vector<u8> out;
+    u32 next_id = 0;
+    const auto append = [&](CacheEntryType entry_type, u64 id, const Header& source,
+                            std::span<const u8> payload) {
+        Header header = source;
+        header.type = entry_type;
+        header.id = id;
+        header.entry_size = static_cast<u32>(payload.size() + headers_size);
+        Footer footer{};
+        footer.version.Assign(Footer::ENTRY_VERSION);
+        footer.entry_id.Assign(next_id++);
+        footer.entry_size = header.entry_size;
+        const auto bytes = [&](const auto& object) {
+            const auto* p = reinterpret_cast<const u8*>(&object);
+            out.insert(out.end(), p, p + sizeof(object));
+        };
+        bytes(header);
+        out.insert(out.end(), payload.begin(), payload.end());
+        bytes(footer);
+    };
+    Header info_header{};
+    info_header.entry_version = Header::ENTRY_VERSION;
+    append(CacheEntryType::FILE_INFO, 0, info_header, info_bytes);
+
+    std::unordered_set<u64> seen;
+    const auto key = [](const Header& h) {
+        return Common::HashCombine(static_cast<u64>(h.Type()), h.Id());
+    };
+    size_t added = 0;
+    for (size_t i = 1; i < own.size(); i++) {
+        seen.insert(key(own[i].header));
+        append(own[i].header.Type(), own[i].header.Id(), own[i].header, own[i].payload);
+    }
+    for (size_t i = 1; i < imported.size(); i++) {
+        if (seen.insert(key(imported[i].header)).second) {
+            append(imported[i].header.Type(), imported[i].header.Id(), imported[i].header,
+                   imported[i].payload);
+            added++;
+        }
+    }
+    if (added == 0 && !own.empty()) {
+        // Already merged. The import may stay behind when its folder is not
+        // ours to delete (devicectl creates folders owned by root); leave the
+        // cache alone so its SPIR-V is not regenerated on every boot.
+        return true;
+    }
+
+    const std::string temp_path = cache_path + ".import";
+    {
+        FileUtil::CreateFullPath(temp_path);
+        FileUtil::IOFile file(temp_path, "wb");
+        if (!file.IsOpen() || file.WriteBytes(out.data(), out.size()) != out.size()) {
+            LOG_ERROR(Render_Vulkan, "Shader cache import: cannot write {}", temp_path);
+            return false;
+        }
+    }
+    FileUtil::Delete(cache_path);
+    if (!FileUtil::Rename(temp_path, cache_path)) {
+        LOG_ERROR(Render_Vulkan, "Shader cache import: cannot replace {}", cache_path);
+        return false;
+    }
+    LOG_INFO(Render_Vulkan, "Shader cache import: {} new of {} entries merged into {}", added,
+             imported.size() - 1, cache_path);
+    return true;
+}
+
 bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) {
     std::vector<size_t> pending_configs;
     std::unordered_map<u64, size_t> pending_programs;
     std::unique_ptr<Pica::ShaderSetup> shader_setup;
     std::unique_ptr<CacheFile> regenerate_file;
+    // Reuse summary, logged at the end: shows whether a cache from another device was usable.
+    size_t spirv_loaded = 0, configs_linked = 0, configs_rebuilt = 0, configs_rejected = 0;
 
     auto cleanup_on_error = [&]() {
         programmable_vertex_cache.clear();
@@ -629,6 +803,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
         regenerate_file = std::make_unique<CacheFile>(GetVSFile(title_id, true));
     }
 
+    const bool regenerate_file_used = regenerate_file != nullptr;
     if (regenerate_file) {
         RecreateCache(*regenerate_file, CacheFileType::VS_CACHE);
     }
@@ -700,6 +875,8 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
                         // be re-generated at runtime or during config and program processing.
                         LOG_ERROR(Render_Vulkan, "Unexpected program compilation failure");
                         programmable_vertex_cache.erase(iter_prog);
+                    } else {
+                        spirv_loaded++;
                     }
                 }
             }
@@ -745,6 +922,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
 
         if (curr.Id() != entry->vs_config.Hash()) {
             LOG_ERROR(Render_Vulkan, "Unexpected PicaVSConfig hash mismatch");
+            configs_rejected++;
             continue;
         }
 
@@ -768,6 +946,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
 
                 iter_config->second = &shader_it->second;
                 known_vertex_programs.emplace(entry->program_entry_id).second;
+                configs_linked++;
             } else {
                 // Cached SPIRV not found, need to recompile.
 
@@ -784,6 +963,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
                         // Program code not in disk cache, should never happen.
                         LOG_ERROR(Render_Vulkan, "Missing program code for config entry");
                         programmable_vertex_map.erase(iter_config);
+                        configs_rejected++;
                         continue;
                     }
 
@@ -824,6 +1004,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
                     entry->vs_config.state.swizzle_hash != shader_setup->GetSwizzleDataHash()) {
                     LOG_ERROR(Render_Vulkan, "Unexpected ShaderSetup hash mismatch");
                     programmable_vertex_map.erase(iter_config);
+                    configs_rejected++;
                     continue;
                 }
 
@@ -834,6 +1015,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
                 if (program_glsl.empty()) {
                     LOG_ERROR(Render_Vulkan, "Failed to retrieve programmable vertex shader");
                     programmable_vertex_map.erase(iter_config);
+                    configs_rejected++;
                     continue;
                 }
 
@@ -870,6 +1052,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
 
                 // Asign the SPIRV shader to the config
                 iter_config->second = &iter_prog->second;
+                configs_rebuilt++;
 
                 LOG_DEBUG(Render_Vulkan, "    linked with SPIRV {:016X}.", entry->spirv_entry_id);
             }
@@ -883,6 +1066,12 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
         FileUtil::Rename(GetVSFile(title_id, true), GetVSFile(title_id, false));
     }
 
+    LOG_INFO(Render_Vulkan,
+             "VS disk cache: {} SPIR-V loaded, {} configs linked to it, {} rebuilt from "
+             "config, {} rejected{}",
+             spirv_loaded, configs_linked, configs_rebuilt, configs_rejected,
+             regenerate_file_used ? " (regenerated)" : "");
+
     // Switch to append mode to receive new entries.
     return vs_cache.SwitchMode(CacheFile::CacheOpMode::APPEND);
 }
@@ -891,6 +1080,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) {
     std::vector<std::pair<u64, size_t>> pending_configs;
     std::unique_ptr<CacheFile> regenerate_file;
+    size_t spirv_loaded = 0, configs_rebuilt = 0, configs_rejected = 0;
 
     auto cleanup_on_error = [&]() {
         fragment_shaders.clear();
@@ -939,6 +1129,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
         regenerate_file = std::make_unique<CacheFile>(GetFSFile(title_id, true));
     }
 
+    const bool regenerate_file_used = regenerate_file != nullptr;
     if (regenerate_file) {
         RecreateCache(*regenerate_file, CacheFileType::FS_CACHE);
     }
@@ -1001,6 +1192,8 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
                         // be regenerated at runtime or during config processing.
                         LOG_ERROR(Render_Vulkan, "Unexpected program compilation failure");
                         fragment_shaders.erase(iter_spirv);
+                    } else {
+                        spirv_loaded++;
                     }
                 }
             }
@@ -1053,6 +1246,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
         const auto fs_config_hash = entry->fs_config.Hash();
         if (curr.Id() != fs_config_hash) {
             LOG_ERROR(Render_Vulkan, "Unexpected FSConfig hash mismatch");
+            configs_rejected++;
             continue;
         }
 
@@ -1076,6 +1270,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
             if (code_glsl.empty()) {
                 LOG_ERROR(Render_Vulkan, "Failed to retrieve programmable vertex shader");
                 fragment_shaders.erase(it);
+                configs_rejected++;
                 continue;
             }
 
@@ -1083,6 +1278,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
             shader.module = CompileSPV(spirv, parent.instance.GetDevice());
         }
         shader.MarkDone();
+        configs_rebuilt++;
 
         if (regenerate_file) {
             // Append the config and SPIRV to the new file.
@@ -1099,6 +1295,12 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
         regenerate_file.reset();
         FileUtil::Rename(GetFSFile(title_id, true), GetFSFile(title_id, false));
     }
+
+    LOG_INFO(Render_Vulkan,
+             "FS disk cache: {} configs, {} SPIR-V loaded, {} rebuilt from config, {} "
+             "rejected{}",
+             pending_configs.size(), spirv_loaded, configs_rebuilt, configs_rejected,
+             regenerate_file_used ? " (regenerated)" : "");
 
     // Switch to append mode to receive new entries.
     return fs_cache.SwitchMode(CacheFile::CacheOpMode::APPEND);
@@ -1326,6 +1528,10 @@ bool ShaderDiskCache::InitGSCache(const std::atomic_bool& stop_loading,
         FileUtil::Rename(GetGSFile(title_id, true), GetGSFile(title_id, false));
     }
 
+    LOG_INFO(Render_Vulkan, "GS disk cache: {} configs known, {} shaders built",
+             known_geometry_shaders.size() + pending_configs.size(),
+             fixed_geometry_shaders.size());
+
     // Switch to append mode to receive new entries.
     return gs_cache.SwitchMode(CacheFile::CacheOpMode::APPEND);
 }
@@ -1333,7 +1539,11 @@ bool ShaderDiskCache::InitGSCache(const std::atomic_bool& stop_loading,
 bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) {
 
-    auto cleanup_on_error = [&]() { graphics_pipelines.clear(); };
+    auto cleanup_on_error = [&]() {
+        // Workers may still be building queued pipelines.
+        parent.pipeline_workers.WaitForRequests();
+        graphics_pipelines.clear();
+    };
 
     LOG_INFO(Render_Vulkan, "Loading PL disk shader cache for title {:016X}", title_id);
 
@@ -1367,6 +1577,7 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
 
     size_t current_callback_index = 0;
     size_t tot_callback_index = tot_entries - 1;
+    size_t pipelines_queued = 0, pipelines_duplicate = 0, pipelines_rejected = 0;
 
     // There is only one entry type in the pipeline info cache,
     // no need to keep track of anything.
@@ -1395,14 +1606,22 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
 
             if (callback) {
                 callback(VideoCore::LoadCallbackStage::Build, current_callback_index++,
-                         tot_callback_index, "Pipeline");
+                         tot_callback_index, "Pipeline list");
             }
 
             known_graphic_pipelines.emplace(curr.Id());
-            auto pl_hash_opt = entry->pl_info.OptimizedHash(parent.instance);
+
+            // Older entries hold stale data in unused binding slots, which made
+            // copies of the same pipeline look different. Clear it so they dedupe.
+            StaticPipelineInfo pl_info = entry->pl_info;
+            for (u32 b = pl_info.vertex_layout.binding_count; b < MAX_VERTEX_BINDINGS; b++) {
+                pl_info.vertex_layout.bindings[b] = {};
+            }
+            auto pl_hash_opt = pl_info.OptimizedHash(parent.instance);
 
             if (graphics_pipelines.find(pl_hash_opt) != graphics_pipelines.end()) {
                 // Multiple entries can have the same optimized hash. Skip if that's the case.
+                pipelines_duplicate++;
                 LOG_DEBUG(Render_Vulkan, "    skipping.", curr.Id());
                 continue;
             }
@@ -1412,16 +1631,17 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
             std::array<Shader*, MAX_SHADER_STAGES> shaders;
 
             LOG_DEBUG(Render_Vulkan, "    uses VS: {:016X}, FS: {:016X}, GS: {:016X}",
-                      entry->pl_info.shader_ids[ProgramType::VS],
-                      entry->pl_info.shader_ids[ProgramType::FS],
-                      entry->pl_info.shader_ids[ProgramType::GS]);
+                      pl_info.shader_ids[ProgramType::VS],
+                      pl_info.shader_ids[ProgramType::FS],
+                      pl_info.shader_ids[ProgramType::GS]);
 
-            if (entry->pl_info.shader_ids[ProgramType::VS]) {
+            if (pl_info.shader_ids[ProgramType::VS]) {
                 auto it_vs =
-                    programmable_vertex_map.find(entry->pl_info.shader_ids[ProgramType::VS]);
+                    programmable_vertex_map.find(pl_info.shader_ids[ProgramType::VS]);
                 if (it_vs == programmable_vertex_map.end()) {
                     LOG_ERROR(Render_Vulkan, "Missing vertex shader {:016X} for pipeline {:016X}",
-                              entry->pl_info.shader_ids[ProgramType::VS], curr.Id());
+                              pl_info.shader_ids[ProgramType::VS], curr.Id());
+                    pipelines_rejected++;
                     continue;
                 }
                 shaders[ProgramType::VS] = it_vs->second;
@@ -1429,22 +1649,24 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
                 shaders[ProgramType::VS] = &parent.trivial_vertex_shader;
             }
 
-            auto it_fs = fragment_shaders.find(entry->pl_info.shader_ids[ProgramType::FS]);
+            auto it_fs = fragment_shaders.find(pl_info.shader_ids[ProgramType::FS]);
             if (it_fs == fragment_shaders.end()) {
                 LOG_ERROR(Render_Vulkan, "Missing fragment shader {:016X} for pipeline {:016X}",
-                          entry->pl_info.shader_ids[ProgramType::FS], curr.Id());
+                          pl_info.shader_ids[ProgramType::FS], curr.Id());
+                pipelines_rejected++;
                 continue;
             }
             shaders[ProgramType::FS] = &it_fs->second;
 
             if (parent.instance.UseGeometryShaders() &&
                 !parent.instance.IsFragmentShaderBarycentricSupported() &&
-                entry->pl_info.shader_ids[ProgramType::GS]) {
+                pl_info.shader_ids[ProgramType::GS]) {
                 auto it_gs =
-                    fixed_geometry_shaders.find(entry->pl_info.shader_ids[ProgramType::GS]);
+                    fixed_geometry_shaders.find(pl_info.shader_ids[ProgramType::GS]);
                 if (it_gs == fixed_geometry_shaders.end()) {
                     LOG_ERROR(Render_Vulkan, "Missing geometry shader {:016X} for pipeline {:016X}",
-                              entry->pl_info.shader_ids[ProgramType::GS], curr.Id());
+                              pl_info.shader_ids[ProgramType::GS], curr.Id());
+                    pipelines_rejected++;
                     continue;
                 }
                 shaders[ProgramType::GS] = &it_gs->second;
@@ -1455,21 +1677,61 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
             // Build the pipeline using the cached pipeline info.
             // The dynamic state can be left default initialized.
             PipelineInfo info{};
-            info.state = entry->pl_info;
+            info.state = pl_info;
 
             auto [it_pl, _] = graphics_pipelines.try_emplace(pl_hash_opt);
             it_pl.value() = std::make_unique<GraphicsPipeline>(
                 parent.instance, parent.renderpass_cache, info, *parent.driver_pipeline_cache,
                 *parent.pipeline_layout, shaders, &parent.pipeline_workers);
 
-            it_pl.value()->TryBuild(false);
+            // Build on the worker pool instead of this thread: the driver cache makes
+            // each build short, but there are thousands, and they run again after
+            // every save state load because loading recreates the renderer.
+            it_pl.value()->TryBuild(false, false);
 
-            LOG_DEBUG(Render_Vulkan, "    built.");
+            LOG_DEBUG(Render_Vulkan, "    queued.");
+            pipelines_queued++;
 
         } else {
             MALFORMED_DISK_CACHE;
         }
     }
+
+    // The game starts with every known pipeline ready, as when they were built inline.
+    // With a large cache and nothing in the driver's shader cache yet (a first
+    // start, or a cache from another device) this takes minutes, so report the
+    // builds as they finish.
+    if (callback && !graphics_pipelines.empty()) {
+        std::vector<GraphicsPipeline*> queued;
+        queued.reserve(graphics_pipelines.size());
+        for (const auto& [hash, pipeline] : graphics_pipelines) {
+            queued.push_back(pipeline.get());
+        }
+        size_t last_done = SIZE_MAX;
+        auto last_change = std::chrono::steady_clock::now();
+        while (!stop_loading) {
+            const size_t done = std::count_if(queued.begin(), queued.end(),
+                                              [](GraphicsPipeline* p) { return p->IsDone(); });
+            callback(VideoCore::LoadCallbackStage::Build, done, queued.size(), "Pipeline");
+            const auto now = std::chrono::steady_clock::now();
+            if (done != last_done) {
+                last_done = done;
+                last_change = now;
+            }
+            // Pipelines whose shaders were not ready are not queued and never
+            // finish here; WaitForRequests below is the real barrier.
+            if (done == queued.size() || now - last_change > std::chrono::seconds(10)) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    parent.pipeline_workers.WaitForRequests();
+
+    LOG_INFO(Render_Vulkan,
+             "PL disk cache: {} entries, {} pipelines built, {} duplicates, {} rejected "
+             "(missing shader)",
+             tot_entries - 1, pipelines_queued, pipelines_duplicate, pipelines_rejected);
 
     // Switch to append mode to receive new entries.
     return pl_cache.SwitchMode(CacheFile::CacheOpMode::APPEND);

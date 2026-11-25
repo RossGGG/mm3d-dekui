@@ -141,6 +141,16 @@ void Material::LoadFromDisk(bool flip_png) noexcept {
     state = DecodeState::Decoded;
 }
 
+void Material::Unload() noexcept {
+    for (CustomTexture* const texture : textures) {
+        if (texture) {
+            std::vector<u8>().swap(texture->data);
+        }
+    }
+    size = 0;
+    state = DecodeState::None;
+}
+
 void Material::AddMapTexture(CustomTexture* texture) noexcept {
     const std::size_t index = static_cast<std::size_t>(texture->type);
     if (textures[index]) {

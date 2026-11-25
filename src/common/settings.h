@@ -93,6 +93,13 @@ enum class StereoRenderOption : u32 {
     CardboardVR = 6
 };
 
+/// Where the emulated 3DS gyroscope and accelerometer read from (Dekui).
+enum class MotionSource : u32 {
+    Off = 0,          ///< The console lies still.
+    Controller = 1,   ///< The game controller's sensors, else the profile's motion device.
+    HeadTracking = 2, ///< The wearer's head pose (visionOS).
+};
+
 // Which eye to render when 3d is off. 800px wide mode could be added here in the future, when
 // implemented
 enum class MonoRenderOption : u32 {
@@ -479,6 +486,9 @@ struct Values {
     std::vector<InputProfile> input_profiles; ///< The list of input profiles
     std::vector<TouchFromButtonMap> touch_from_button_maps;
     Setting<bool> use_artic_base_controller{false, Keys::use_artic_base_controller};
+    Setting<MotionSource> motion_source{MotionSource::Controller, Keys::motion_source};
+    /// Gyroscope scale for the controller and head tracking, in percent.
+    Setting<u32, true> motion_sensitivity{100, 25, 400, Keys::motion_sensitivity};
 
     SwitchableSetting<bool> enable_gamemode{true, Keys::enable_gamemode};
 
@@ -694,6 +704,14 @@ void SetConfiguringGlobal(bool is_global);
 float Volume();
 
 void LogSettings();
+
+/// The 3D slider position reported to the game, 0-1. With 3D off the slider
+/// reads as down, so games render one eye instead of both (unless the right
+/// eye is the one shown).
+float Effective3DSlider();
+/// Scales the 3D slider the game sees, e.g. for a much larger stereo display
+/// than the 3DS screen (Dekui's immersive view). 1 by default.
+void SetStereoDepthScale(float scale);
 
 // Restore the global state of all applicable settings in the Values struct
 void RestoreGlobalState(bool is_powered_on);

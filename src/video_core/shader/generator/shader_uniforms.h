@@ -75,8 +75,19 @@ struct VSUniformData {
     float clip_scale_x = 1.f;
     float clip_scale_y = 1.f;
     alignas(16) Common::Vec4f clip_coef;
+    // MM3D immersive HUD: when set, clip x, y and w come from this projective
+    // transform of the vertex's (x, y, w), rows .xyz, in place of clip_scale.
+    u32 hud_transform = 0;
+    // PICA depth mapping applied to clip z (Profile::vk_vertex_depth), in the
+    // std140 padding before hud_row0.
+    float depth_scale = 0.f;
+    float depth_offset = 0.f;
+    u32 vertex_depth = 0;
+    alignas(16) Common::Vec4f hud_row0{1.f, 0.f, 0.f, 0.f};
+    alignas(16) Common::Vec4f hud_row1{0.f, 1.f, 0.f, 0.f};
+    alignas(16) Common::Vec4f hud_row2{0.f, 0.f, 1.f, 0.f};
 };
-static_assert(sizeof(VSUniformData) == 32,
+static_assert(sizeof(VSUniformData) == 96,
               "The size of the VSUniformData does not match the structure in the shader");
 static_assert(sizeof(VSUniformData) < 16384,
               "VSUniformData structure must be less than 16kb as per the OpenGL spec");

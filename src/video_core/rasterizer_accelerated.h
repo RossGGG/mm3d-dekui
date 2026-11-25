@@ -74,6 +74,8 @@ protected:
     Pica::Shader::Generator::FSUniformData fs_data{};
     bool vs_data_dirty = true;
     bool fs_data_dirty = true;
+    /// The backend applies the PICA depth mapping per vertex (VSUniformData::vertex_depth).
+    bool vertex_depth_supported = false;
 };
 
 } // namespace VideoCore

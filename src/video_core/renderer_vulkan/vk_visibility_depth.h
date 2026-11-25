@@ -44,7 +44,8 @@ private:
                  const MM3D::VisibilityDepth::Context& context, u64 now_ns);
     const Instance& instance;
     Scheduler& scheduler;
-    std::array<Slot, 3> slots{};
+    // Selected + up to two frames pending on the GPU + one free for the next capture.
+    std::array<Slot, 4> slots{};
     std::optional<unsigned> selected;
     std::optional<MM3D::VisibilityDepth::Context> batch;
     u64 batch_surface{}, batch_modification{};

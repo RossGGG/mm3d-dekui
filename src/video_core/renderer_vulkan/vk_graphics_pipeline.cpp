@@ -5,6 +5,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/hitch_trace.h"
 #include "common/hash.h"
 #include "common/microprofile.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
@@ -81,7 +82,7 @@ GraphicsPipeline::GraphicsPipeline(const Instance& instance_, RenderManager& ren
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
-bool GraphicsPipeline::TryBuild(bool wait_built) {
+bool GraphicsPipeline::TryBuild(bool wait_built, bool try_driver_cache) {
     // The pipeline is currently being compiled. We can either wait for it
     // or skip the draw.
     if (is_pending) {
@@ -96,7 +97,8 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
     }
 
     // Ask the driver if it can give us the pipeline quickly.
-    if (!shaders_pending && instance.IsPipelineCreationCacheControlSupported() && Build(true)) {
+    if (try_driver_cache && !shaders_pending && instance.IsPipelineCreationCacheControlSupported() &&
+        Build(true)) {
         return true;
     }
 
@@ -108,6 +110,9 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
 
 bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     MICROPROFILE_SCOPE(Vulkan_Pipeline);
+    const Common::HitchTrace::Scope hitch_scope{fail_on_compile_required
+                                                    ? Common::HitchTrace::Phase::PipelineInline
+                                                    : Common::HitchTrace::Phase::PipelineBuild};
 
     const u32 stride_alignment = instance.GetMinVertexStrideAlignment();
     std::array<vk::VertexInputBindingDescription, MAX_VERTEX_BINDINGS> bindings;
@@ -153,7 +158,9 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     };
 
     const vk::PipelineRasterizationStateCreateInfo raster_state = {
-        .depthClampEnable = false,
+        // With vertex depth, clip planes do the PICA z clipping and depth clamp
+        // matches the clamping of the per-fragment depth write it replaces.
+        .depthClampEnable = instance.UseVertexDepth(),
         .rasterizerDiscardEnable = false,
         .cullMode = PicaToVK::CullMode(info.state.rasterization.cull_mode,
                                        info.state.rasterization.flip_viewport),

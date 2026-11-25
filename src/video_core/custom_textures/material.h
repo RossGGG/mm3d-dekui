@@ -76,6 +76,10 @@ struct Material {
 
     void LoadFromDisk(bool flip_png) noexcept;
 
+    /// Frees the decoded pixels once the GPU has a copy. The next use decodes
+    /// the material from disk again.
+    void Unload() noexcept;
+
     void AddMapTexture(CustomTexture* texture) noexcept;
 
     [[nodiscard]] CustomTexture* Map(MapType type) const noexcept {

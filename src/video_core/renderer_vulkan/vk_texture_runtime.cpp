@@ -7,9 +7,12 @@
 
 #include "video_core/renderer_vulkan/vk_texture_runtime.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <string>
+#include <string_view>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include <vulkan/vulkan.hpp>
@@ -40,6 +43,12 @@ MICROPROFILE_DEFINE(Vulkan_ImageAlloc, "Vulkan", "Texture Allocation", MP_RGB(19
 namespace Vulkan {
 
 namespace {
+
+std::atomic<bool> rgba8_storage{[] {
+    const char* value = std::getenv("DEKUI_RGBA8_STORAGE");
+    return value && std::string_view{value} == "1";
+}()};
+std::atomic<bool> rgba8_storage_requested{};
 
 using VideoCore::MapType;
 using VideoCore::PixelFormat;
@@ -165,6 +174,22 @@ constexpr u64 UPLOAD_BUFFER_SIZE = 512_MiB;
 constexpr u64 DOWNLOAD_BUFFER_SIZE = 16_MiB;
 
 } // Anonymous namespace
+
+bool TextureRuntime::RGBA8Storage() {
+    return rgba8_storage.load(std::memory_order_relaxed);
+}
+
+void TextureRuntime::EnableRGBA8Storage() {
+    rgba8_storage.store(true, std::memory_order_relaxed);
+}
+
+bool TextureRuntime::RequestRGBA8Storage() {
+    return !rgba8_storage_requested.exchange(true, std::memory_order_relaxed);
+}
+
+bool TextureRuntime::RGBA8StorageRequested() {
+    return rgba8_storage_requested.load(std::memory_order_relaxed);
+}
 
 void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::Format format,
                     vk::ImageUsageFlags usage, vk::ImageCreateFlags flags,
@@ -358,6 +383,14 @@ bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
     }
 
     if (src_format == PixelFormat::D24S8 && dst_format == PixelFormat::RGBA8) {
+        // The conversion writes the destination as a storage image.
+        if (!RGBA8Storage()) {
+            if (RequestRGBA8Storage()) {
+                LOG_INFO(Render_Vulkan,
+                         "D24S8 reinterpretation used: recreating surfaces with storage usage");
+            }
+            return false;
+        }
         blit_helper.ConvertDS24S8ToRGBA8(source, dest, copy);
     } else {
         LOG_WARNING(Render_Vulkan, "Unimplemented reinterpretation {} -> {}",
@@ -784,6 +817,9 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
     }
 
     const vk::Format format = traits.native;
+    const bool storage_wanted =
+        TextureRuntime::RGBA8Storage() || True(flags & VideoCore::SurfaceFlagBits::ShadowSource);
+    is_mutable &= storage_wanted;
 
     ASSERT_MSG(format != vk::Format::eUndefined && levels >= 1,
                "Image allocation parameters are invalid");
@@ -810,6 +846,9 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         // Add Storage-usage support when available in case it is found out later that this is a
         // shadow-source texture that will get used in the utility descriptor-set
         usage |= vk::ImageUsageFlagBits::eStorage;
+    }
+    if (!storage_wanted) {
+        usage &= ~vk::ImageUsageFlagBits::eStorage;
     }
 
     const bool need_format_list = is_mutable && instance.IsImageFormatListSupported();
@@ -1164,7 +1203,13 @@ void Surface::ScaleUp(u32 new_scale) {
 
     res_scale = new_scale;
 
-    const bool is_mutable = pixel_format == VideoCore::PixelFormat::RGBA8;
+    const bool storage_wanted =
+        TextureRuntime::RGBA8Storage() || True(flags & VideoCore::SurfaceFlagBits::ShadowSource);
+    const bool is_mutable = pixel_format == VideoCore::PixelFormat::RGBA8 && storage_wanted;
+    auto usage = traits.usage;
+    if (!storage_wanted) {
+        usage &= ~vk::ImageUsageFlagBits::eStorage;
+    }
 
     vk::ImageCreateFlags flags{};
     if (texture_type == VideoCore::TextureType::CubeMap) {
@@ -1175,7 +1220,7 @@ void Surface::ScaleUp(u32 new_scale) {
     }
 
     handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
-                                 traits.native, traits.usage, flags, traits.aspect, false,
+                                 traits.native, usage, flags, traits.aspect, false,
                                  DebugName(true));
     current = Type::Scaled;
 

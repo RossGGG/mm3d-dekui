@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <json.hpp>
+#include <algorithm>
 #include "common/file_util.h"
 #include "common/literals.h"
 #include "common/memory_detect.h"
@@ -71,10 +72,23 @@ void CustomTexManager::TickFrame() {
             return;
         }
         switch (it->material->state) {
-        case DecodeState::Decoded:
+        case DecodeState::Decoded: {
             it->func();
             num_uploads++;
+            // The GPU now holds the texture: keeping the decoded pixels too
+            // doubles the memory each one costs (64 MiB per 4K texture),
+            // enough for a high-resolution pack to exhaust memory on devices
+            // with a per-app limit. Free them unless another queued upload
+            // still needs this material; a later use decodes it again.
+            Material* const material = it->material;
+            const bool needed_again =
+                std::any_of(async_uploads.begin(), async_uploads.end(),
+                            [&](const auto& other) { return &other != &*it && other.material == material; });
+            if (!needed_again) {
+                material->Unload();
+            }
             [[fallthrough]];
+        }
         case DecodeState::Failed:
             it = async_uploads.erase(it);
             continue;

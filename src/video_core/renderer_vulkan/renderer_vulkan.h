@@ -96,16 +96,20 @@ private:
     void RenderScreenshot();
     void RenderScreenshotWithStagingCopy();
     bool TryRenderScreenshotWithHostMemory();
-    void PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout);
+    void PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout,
+                     bool transparent = false);
     void RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
                         bool flipped);
 
-    void DrawScreens(Frame* frame, const Layout::FramebufferLayout& layout, bool flipped);
+    void DrawScreens(Frame* frame, const Layout::FramebufferLayout& layout, bool flipped,
+                     bool host_hud_only = false);
     void DrawBottomScreen(const Layout::FramebufferLayout& layout,
                           const Common::Rectangle<u32>& bottom_screen);
 
 #ifdef ENABLE_MM3D_PRESENTATION
     bool midpoint_presenting{};
+    /// Immersive wide view: copies the HUD layer into `frame` for the presenter.
+    void CopyWideHud(Frame& frame);
     bool midpoint_async_skip{};
     MM3D::CameraMidpoint::PresentationClock midpoint_clock;
     unsigned midpoint_present_generation{};
@@ -113,7 +117,8 @@ private:
     s64 midpoint_status_time{};
     unsigned midpoint_status_pairs{};
     void CaptureMidpointFrame(Frame* frame, const std::string& path);
-    void DrawMidpointTop(const Common::Rectangle<u32>& top_screen);
+    void DrawMidpointTop(const Layout::FramebufferLayout& layout,
+                         const Common::Rectangle<u32>& top_screen);
 #endif
     void DrawTopScreen(const Layout::FramebufferLayout& layout,
                        const Common::Rectangle<u32>& top_screen);

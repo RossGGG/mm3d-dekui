@@ -318,7 +318,9 @@ public:
                               Common::ThreadWorker* worker);
     ~GraphicsPipeline();
 
-    bool TryBuild(bool wait_built);
+    /// try_driver_cache first asks the driver for a cached pipeline on this
+    /// thread. Pass false for pipelines the driver cache cannot have.
+    bool TryBuild(bool wait_built, bool try_driver_cache = true);
 
     bool Build(bool fail_on_compile_required = false);
 

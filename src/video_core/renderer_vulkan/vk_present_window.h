@@ -3,6 +3,9 @@
 // Refer to the license.txt file included.
 
 #include <atomic>
+#ifdef ENABLE_MM3D_PRESENTATION
+#include "mm3d/wide_view.h"
+#endif
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -33,9 +36,24 @@ struct Frame {
 #ifdef ENABLE_MM3D_PRESENTATION
     MM3D::InputLatency::Frame input_timing;
     bool interpolated_pair{};
+    /// The game camera this frame shows, for the immersive wide view.
+    MM3D::WideView::Camera wide_camera{};
+    /// The wide view's HUD layer, copied for this frame (exportable to Metal).
+    vk::Image hud_image{};
+    VmaAllocation hud_allocation{};
+    u32 hud_width{}, hud_height{};
+    bool hud_initialized{}, hud_valid{};
+    /// Transparent, display-oriented host UI for the immersive HUD plane.
+    vk::Image host_hud_image{};
+    VmaAllocation host_hud_allocation{};
+    vk::ImageView host_hud_view{};
+    vk::Framebuffer host_hud_framebuffer{};
+    bool host_hud_valid{};
 #endif
     u32 width;
     u32 height;
+    /// 2 when the frame holds both eyes side by side.
+    u32 eyes{1};
     VmaAllocation allocation;
     vk::Framebuffer framebuffer;
     vk::Image image;
@@ -82,6 +100,16 @@ private:
     void PresentThread(std::stop_token token);
 
     void CopyToSwapchain(Frame* frame, bool repeat = false);
+
+    /// Hands the frame to ExternalPresent's sink instead of the swapchain.
+    void PresentExternal(Frame* frame, bool repeat);
+    /// Waits until ExternalPresent's sink has finished reading the frame's images.
+    void WaitForExternalReads(Frame* frame);
+
+#ifdef ENABLE_MM3D_PRESENTATION
+    /// Saves or restores the clean composition and draws the overlay.
+    void RecordComposition(vk::CommandBuffer cmdbuf, Frame* frame, bool repeat);
+#endif
 
     vk::RenderPass CreateRenderpass();
 

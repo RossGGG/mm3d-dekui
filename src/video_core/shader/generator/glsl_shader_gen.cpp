@@ -37,9 +37,31 @@ layout (binding = 1, std140) uniform vs_data {
     float clip_scale_x;
     float clip_scale_y;
     vec4 clip_coef;
+    bool hud_transform;
+    float depth_scale;
+    float depth_offset;
+    bool vertex_depth;
+    vec4 hud_row0;
+    vec4 hud_row1;
+    vec4 hud_row2;
 };
 
 const vec2 EPSILON_Z = vec2(0.000001f, -1.00001f);
+
+// With vertex_depth, clip z carries the PICA depth mapping (z/w * scale + offset)
+// that fragment shaders would otherwise write to gl_FragDepth. Writing depth
+// per fragment turns off early depth tests and hidden surface removal.
+vec4 DekuiClip(vec4 vtx_pos) {
+    if (hud_transform) {
+        vec3 h = vec3(vtx_pos.x, vtx_pos.y, vtx_pos.w);
+        float w = dot(hud_row2.xyz, h);
+        float z = vertex_depth ? (vtx_pos.z / vtx_pos.w * depth_scale + depth_offset) * w
+                               : -vtx_pos.z / vtx_pos.w * w;
+        return vec4(dot(hud_row0.xyz, h), dot(hud_row1.xyz, h), z, w);
+    }
+    float z = vertex_depth ? vtx_pos.z * depth_scale + depth_offset * vtx_pos.w : -vtx_pos.z;
+    return vec4(vtx_pos.x * clip_scale_x, vtx_pos.y * clip_scale_y, z, vtx_pos.w);
+}
 
 vec4 SanitizeVertex(vec4 vtx_pos) {
     float ndc_z = vtx_pos.z / vtx_pos.w;
@@ -83,7 +105,7 @@ static std::string GetVertexInterfaceDeclaration(bool is_output, bool use_clip_p
         out += "    vec4 gl_Position;\n";
 #endif
         if (use_clip_planes) {
-            out += "    float gl_ClipDistance[2];\n";
+            out += "    float gl_ClipDistance[3];\n";
         }
         out += "};\n";
     }
@@ -125,11 +147,12 @@ void main() {
     if (flip_viewport) {
         vtx_pos.y = -vtx_pos.y;
     }
-    gl_Position = vec4(vtx_pos.x * clip_scale_x, vtx_pos.y * clip_scale_y, -vtx_pos.z, vtx_pos.w);
+    gl_Position = DekuiClip(vtx_pos);
 )";
     if (use_clip_planes) {
         out += R"(
         gl_ClipDistance[0] = -vtx_pos.z; // fixed PICA clipping plane z <= 0
+        gl_ClipDistance[2] = vtx_pos.z + vtx_pos.w; // z >= -w, for depth clamp
         if (enable_clip1) {
             gl_ClipDistance[1] = dot(clip_coef, vtx_pos);
         } else {
@@ -247,9 +270,10 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
         out += "    if (flip_viewport) {\n";
         out += "        vtx_pos.y = -vtx_pos.y;\n";
         out += "    }\n";
-        out += "    gl_Position = vec4(vtx_pos.x * clip_scale_x, vtx_pos.y * clip_scale_y, -vtx_pos.z, vtx_pos.w);\n";
+        out += "    gl_Position = DekuiClip(vtx_pos);\n";
         if (extra.use_clip_planes) {
             out += "    gl_ClipDistance[0] = -vtx_pos.z;\n"; // fixed PICA clipping plane z <= 0
+            out += "    gl_ClipDistance[2] = vtx_pos.z + vtx_pos.w;\n"; // z >= -w, for depth clamp
             out += "    if (enable_clip1) {\n";
             out += "        gl_ClipDistance[1] = dot(clip_coef, vtx_pos);\n";
             out += "    } else {\n";
@@ -349,9 +373,10 @@ struct Vertex {
     out += "    if (flip_viewport) {\n";
     out += "        vtx_pos.y = -vtx_pos.y;\n";
     out += "    }\n";
-    out += "    gl_Position = vec4(vtx_pos.x * clip_scale_x, vtx_pos.y * clip_scale_y, -vtx_pos.z, vtx_pos.w);\n";
+    out += "    gl_Position = DekuiClip(vtx_pos);\n";
     if (extra.use_clip_planes) {
         out += "    gl_ClipDistance[0] = -vtx_pos.z;\n"; // fixed PICA clipping plane z <= 0
+        out += "    gl_ClipDistance[2] = vtx_pos.z + vtx_pos.w;\n"; // z >= -w, for depth clamp
         out += "    if (enable_clip1) {\n";
         out += "        gl_ClipDistance[1] = dot(clip_coef, vtx_pos);\n";
         out += "    } else {\n";

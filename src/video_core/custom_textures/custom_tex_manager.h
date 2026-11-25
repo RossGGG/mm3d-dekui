@@ -25,7 +25,7 @@ namespace VideoCore {
 class SurfaceParams;
 
 struct AsyncUpload {
-    const Material* material;
+    Material* material;
     std::function<bool()> func;
 };
 

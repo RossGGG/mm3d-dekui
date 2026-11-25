@@ -8,6 +8,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
 #include "common/alignment.h"
+#include "common/hitch_trace.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
@@ -124,6 +125,11 @@ void RasterizerCache<T>::TickFrame() {
         }
         UnregisterAll();
     }
+}
+
+template <class T>
+void RasterizerCache<T>::RecreateAll() {
+    UnregisterAll();
 }
 
 template <class T>
@@ -1039,6 +1045,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
 template <class T>
 void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::TextureUpload};
 
     const SurfaceParams load_info = surface.FromInterval(interval);
     ASSERT(load_info.addr >= surface.addr && load_info.end <= surface.end);
@@ -1090,6 +1097,8 @@ u64 RasterizerCache<T>::ComputeHash(const SurfaceParams& load_info, std::span<u8
 template <class T>
 bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
+    // Inside a texture upload; counted in both phases.
+    const Common::HitchTrace::Scope hitch_scope{Common::HitchTrace::Phase::CustomTexture};
 
     Surface& surface = slot_surfaces[surface_id];
     const SurfaceParams load_info = surface.FromInterval(interval);
