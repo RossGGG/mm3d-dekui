@@ -8,4 +8,8 @@ inline std::atomic<bool> enabled{false};
 inline bool Enabled() {
     return enabled.load();
 }
+// CPU interpolation runs every vertex shader on the CPU, which is only usable
+// with the shader JIT. Cleared by the core when no JIT is available (visionOS
+// launched without a JIT enabler); GPU interpolation is used instead.
+inline std::atomic<bool> cpu_vertices_supported{true};
 }

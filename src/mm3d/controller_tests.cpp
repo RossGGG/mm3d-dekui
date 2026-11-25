@@ -36,6 +36,19 @@ int main() {
             if(i==4)p.maptype=Settings::InputMappingType::AllControllers;
             Check(A::Untouched(p,original.buttons,original.analogs)==(i!=4),"unrelated preferences do not prevent mapping; custom mapping mode preserved");
         }
+        {
+            // Motion follows the bound controller, else the active one; never one without a gyro.
+            const auto pad=[](const char* guid,int port,int gyro,int active) {
+                Common::ParamPackage p{{"engine","sdl"},{"api","controller"},{"guid",guid}};
+                p.Set("port",port);p.Set("gyro",gyro);p.Set("active",active);return p;
+            };
+            auto bound=original;
+            bound.buttons[Settings::NativeButton::A]=pad("bbb",0,0,0).Serialize();
+            const std::vector<Common::ParamPackage> pads{pad("aaa",0,1,1),pad("bbb",0,1,0),pad("ccc",0,0,1)};
+            Check(A::MotionController(bound,pads)->Get("guid","")=="bbb","bound controller drives motion");
+            Check(A::MotionController(original,pads)->Get("guid","")=="aaa","keyboard profile uses the active gyro pad");
+            Check(!A::MotionController(original,{pad("ccc",0,0,1)}),"no gyro, no motion controller");
+        }
         SDL_SetMainReady();
         Check(SDL_Init(SDL_INIT_GAMECONTROLLER)==0,"SDL initialization");
         {

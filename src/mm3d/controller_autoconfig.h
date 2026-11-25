@@ -54,12 +54,23 @@ template<class Buttons,class Analogs> bool Managed(const Settings::InputProfile&
     return Map(expected,candidate,buttons,analogs)&&SameBindings(p.buttons,expected.buttons)&&
         SameBindings(p.analogs,expected.analogs);
 }
+// An automatic profile for a controller that is not connected, e.g. a user
+// folder copied from another device, where the same controller has another
+// SDL GUID. Its bindings cannot be checked against the controller (Managed),
+// and they cannot work either; remap it to a connected controller.
+inline bool Stale(const Settings::InputProfile& p,const std::vector<Common::ParamPackage>& controllers) {
+    if(p.name!="Controller (automatic)"||p.maptype!=Settings::InputMappingType::GuidPort)return false;
+    const Common::ParamPackage bound(p.buttons[Settings::NativeButton::A]);
+    if(bound.Get("engine","")!="sdl")return false;
+    return std::none_of(controllers.begin(),controllers.end(),[&](const auto& c){
+        return c.Get("guid","")==bound.Get("guid","");});
+}
 template<class Buttons,class Analogs> std::optional<Settings::InputProfile> Select(
     const Settings::InputProfile& current,std::vector<Common::ParamPackage> controllers,
     const std::array<std::string,Settings::NativeButton::NumButtons>& defaults,
     const std::array<std::string,Settings::NativeAnalog::NumAnalogs>& sticks,
     Buttons buttons,Analogs analogs) {
-    const bool managed=Managed(current,buttons,analogs);
+    const bool managed=Managed(current,buttons,analogs)||Stale(current,controllers);
     if(!managed&&!Untouched(current,defaults,sticks))return {};
     const Common::ParamPackage bound(current.buttons[Settings::NativeButton::A]);
     std::stable_sort(controllers.begin(),controllers.end(),[&](const auto& a,const auto& b) {
@@ -73,6 +84,20 @@ template<class Buttons,class Analogs> std::optional<Settings::InputProfile> Sele
         return result;
     }
     return {};
+}
+// The controller whose gyroscope drives the console's motion sensors: the one
+// the profile's A button is bound to, else the one used last, else any other.
+inline std::optional<Common::ParamPackage> MotionController(const Settings::InputProfile& p,
+    const std::vector<Common::ParamPackage>& controllers) {
+    const Common::ParamPackage bound(p.buttons[Settings::NativeButton::A]);
+    const bool sdl=bound.Get("engine","")=="sdl";
+    std::optional<Common::ParamPackage> best;int best_rank=-1;
+    for(const auto& controller:controllers) {
+        if(!controller.Get("gyro",0))continue;
+        const int rank=(sdl&&SameDevice(controller,bound)?2:0)+(controller.Get("active",0)?1:0);
+        if(rank>best_rank){best=controller;best_rank=rank;}
+    }
+    return best;
 }
 
 }

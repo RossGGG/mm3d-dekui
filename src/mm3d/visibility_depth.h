@@ -54,13 +54,17 @@ template<class M> std::optional<Context> LiveContext(M& memory, U64 frame, U32 g
 }
 // A previous game frame can take 57-60ms on Deck. The old 50ms bound rejected
 // every completed snapshot at that cadence, forcing another synchronous read.
-// Keep the one-frame bound, with a finite wall-clock cap for long stalls/pauses.
-constexpr U64 MaxAgeNs = 100'000'000;
+// When the GPU runs a frame behind (35-45 ms GPU frames on Vision Pro), the
+// previous frame's snapshot is still pending, so a one-frame bound forced the
+// exact read, which waits for the whole queue. Accept two frames, with a finite
+// wall-clock cap for long stalls/pauses.
+constexpr U64 MaxFrameAge = 2;
+constexpr U64 MaxAgeNs = 150'000'000;
 enum class Freshness { Fresh, Scene, FrameAge, WallAge };
 inline Freshness CheckFreshness(const Context& sample, const Context& request,
                                 U64 captured_ns, U64 now_ns) {
     if (!SameScene(sample, request)) return Freshness::Scene;
-    if (request.frame < sample.frame || request.frame - sample.frame > 1)
+    if (request.frame < sample.frame || request.frame - sample.frame > MaxFrameAge)
         return Freshness::FrameAge;
     if (now_ns < captured_ns || now_ns - captured_ns > MaxAgeNs)
         return Freshness::WallAge;

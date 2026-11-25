@@ -4,6 +4,7 @@
 #include "mm3d/owl_sword.h"
 #include "mm3d/classic_owl_presentation.h"
 #include "mm3d/classic_owl_return.h"
+#include "mm3d/wide_view.h"
 #include <array>
 #include <optional>
 #include <vector>
@@ -287,7 +288,9 @@ struct Hook {
             break;
         case 19: {
             const U32 height=(m.Read(r[0]).value_or(0)>>8)&255;
-            r[4]=returning.HideFocusBars(m)?0:(height&128?height|0xffffff00u:height);
+            // The immersive view has no screen edge for cinema bars to frame.
+            r[4]=returning.HideFocusBars(m)||WideView::enabled.load()?0:
+                (height&128?height|0xffffff00u:height);
             break;
         }
         case 18:

@@ -12,8 +12,10 @@ public:
     Overlay(const Vulkan::Instance& instance, vk::Format format, unsigned image_count,
             std::mutex* submit_mutex = nullptr);
     ~Overlay(); // caller must drain GPU and join the presentation thread first
+    /// `eyes` is 2 for a side-by-side stereo frame: the GUI is laid out for
+    /// one eye and drawn into both halves.
     void Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer, unsigned width,
-              unsigned height);
+              unsigned height, unsigned eyes = 1, bool immersive_hud = false);
     void Presented();
 private:
     struct Impl;

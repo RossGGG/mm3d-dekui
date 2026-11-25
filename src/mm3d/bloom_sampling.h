@@ -28,7 +28,10 @@ constexpr bool Matches(const Draw& d) {
     const bool small = d.viewport_x == 4325376 && d.viewport_y == 4390912;
     const bool medium = d.viewport_x == 4390912 && d.viewport_y == 4456448;
     const bool large = d.viewport_x == 4456448 && d.viewport_y == 4521984;
-    const bool composite = d.viewport_x == 4644864 && d.viewport_y == 4624384;
+    // Final composite into the top screen: 480x400 in 2D (half sizes 240 and
+    // 200 as PICA float24), 240x400 per eye in stereo 3D (half width 120).
+    const bool composite = (d.viewport_x == 4644864 || d.viewport_x == 4579328) &&
+                           d.viewport_y == 4624384;
     return (d.width == 256 && d.height == 256 && large) ||
            (d.width == 32 && d.height == 64 && (small || medium || composite)) ||
            (d.width == 16 && d.height == 32 && (small || composite));

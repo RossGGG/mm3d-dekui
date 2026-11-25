@@ -21,6 +21,11 @@ inline bool IsTopViewport(unsigned width,unsigned height) {
     // Inspect guest dimensions, not cache surface offsets or resolution-scaled extents.
     return height==400 && (width==240 || width==480);
 }
+// Draw signatures (WidescreenProbe) were captured in 2D, where the top screen
+// is 480 wide. Stereo 3D renders each eye at 240: treat both as the same screen.
+inline unsigned SignatureWidth(unsigned width,unsigned height) {
+    return IsTopViewport(width,height) ? 480u : width;
+}
 
 // Fit the wider top screen in its available slot. Keep separate neighboring
 // screens outside the slot; an existing overlapping bottom-screen inset stays an inset.

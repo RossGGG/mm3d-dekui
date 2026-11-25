@@ -2,6 +2,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include "mm3d/player_settings.h"
 
 namespace MM3D::PlayerSettings {
@@ -25,6 +26,12 @@ void ApplyPending(Values& values, ApplyRuntime apply_runtime, Persist persist) {
     apply(set_vsync, values.use_vsync, [](int v) { return v != 0; });
     apply(set_cache, values.use_disk_shader_cache, [](int v) { return v != 0; });
     apply(set_textures, values.custom_textures, [](int v) { return v != 0; });
+    using StereoOption = std::decay_t<decltype(values.render_3d.GetValue())>;
+    apply(set_stereo, values.render_3d, [](int v) {
+        return v ? StereoOption::SideBySideFull : StereoOption::Off;
+    });
+    apply(set_depth_3d, values.factor_3d,
+          [](int v) { return std::uint32_t(std::clamp(v, 0, 100)); });
     if (runtime_changed) apply_runtime();
 
     // Hardware shaders are read for each PICA batch. Async compilation is
@@ -47,6 +54,8 @@ void ApplyPending(Values& values, ApplyRuntime apply_runtime, Persist persist) {
     vsync.store(values.use_vsync.GetValue());
     cache.store(values.use_disk_shader_cache.GetValue());
     textures.store(values.custom_textures.GetValue());
+    stereo.store(values.render_3d.GetValue() == StereoOption::SideBySideFull);
+    depth_3d.store(int(values.factor_3d.GetValue()));
     hardware_shaders.store(values.use_hw_shader.GetValue());
     async_shaders.store(values.async_shader_compilation.GetValue());
 }

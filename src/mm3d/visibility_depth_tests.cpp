@@ -30,14 +30,16 @@ int main(int argc, char** argv) {
         Context a{10, 1, 7, 0x123000, 5}, b = a;
         Check(Fresh(a, b, 100, 100), "same frame");
         ++b.frame;
-        Check(Fresh(a, b, 100, 100'000'100), "one frame at time bound");
-        Check(!Fresh(a, b, 100, 100'000'101), "pause/age rejection");
+        Check(Fresh(a, b, 100, 150'000'100), "one frame at time bound");
+        Check(!Fresh(a, b, 100, 150'000'101), "pause/age rejection");
         for (const U64 elapsed : {57'000'000ULL, 58'000'000ULL, 60'000'000ULL})
             Check(Fresh(a, b, 100, 100 + elapsed), "slow previous frame must not force permanent fallback");
-        Check(CheckFreshness(a, b, 100, 100'000'101) == Freshness::WallAge,
+        Check(CheckFreshness(a, b, 100, 150'000'101) == Freshness::WallAge,
               "wall-age rejection classified");
         ++b.frame;
-        Check(!Fresh(a, b, 100, 101), "two frames rejected");
+        Check(Fresh(a, b, 100, 101), "two frames accepted while the GPU runs behind");
+        ++b.frame;
+        Check(!Fresh(a, b, 100, 101), "three frames rejected");
         Check(CheckFreshness(a, b, 100, 101) == Freshness::FrameAge,
               "frame-age rejection classified independently of wall age");
         b.frame = 9; Check(!Fresh(a, b, 100, 101), "frame rollback rejected");

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include "mm3d/wide_view.h"
 
 namespace MM3D::CameraLive {
 using U32 = std::uint32_t;
@@ -33,10 +34,19 @@ inline U32 ProjectionInstruction(U32 pc,U32 instruction) {
     return (pc==0x18d414 || pc==0x18d428 || pc==0x18d570 || pc==0x18d584) && instruction==0xed940a06
         ? 0xef000000U|ProjectionSVC : instruction;
 }
+// The third projection, from the auxiliary FOV (+4c), `vldr s0, [r4, #0x4c]`.
+// Some cameras (the ocarina's close-up) draw with it; only the immersive
+// view widens it.
+constexpr U32 AuxiliaryProjectionSVC=0x00ffff3e;
+constexpr std::array<U32,2> AuxiliaryProjectionPCs{0x18d448,0x18d5a4};
+inline U32 AuxiliaryProjectionInstruction(U32 pc,U32 instruction) {
+    return (pc==AuxiliaryProjectionPCs[0] || pc==AuxiliaryProjectionPCs[1]) && instruction==0xed940a13
+        ? 0xef000000U|AuxiliaryProjectionSVC : instruction;
+}
 inline U32 ProjectionValue(U32 native_bits,float configured) {
     const float native=std::bit_cast<float>(native_bits);
     if(!std::isfinite(native) || native<=0.f || native>=170.f ||
-       !std::isfinite(configured) || configured<=45.f || configured>70.f) return native_bits;
+       !std::isfinite(configured) || configured<=45.f || configured>WideView::MaxFov) return native_bits;
     constexpr float rad=3.14159265358979323846f/360.f;
     // A 45-degree gameplay camera becomes the chosen FOV. Other cameras retain
     // their animation, with the same relative widening in projection space.
@@ -72,6 +82,11 @@ template<class M> bool ChangeModeCodeMatches(M& m) {
     return true;
 }
 template<class M> float ConfiguredFov(M& m,U32 projection) {
+    // Immersive wide view goes past the 70-degree limit of the Camera zoom
+    // setting, and widens scripted cameras too (the ocarina's close-up): its
+    // image is shown at its true angles, so a wider one only shows more.
+    // Full-screen menus keep the native view (it is shown flat).
+    if(WideView::enabled.load()&&!WideView::menu.load())return std::clamp(WideView::fov.load(),WideView::MinFov,WideView::MaxFov);
     // Only the live top-screen projection, not menu or preview cameras.
     if(m.Read(CameraPointer)==std::optional<U32>(projection)&&
        m.Read(projection+4)==std::optional<U32>(0)&&m.Read(projection+8)==std::optional<U32>(400)&&

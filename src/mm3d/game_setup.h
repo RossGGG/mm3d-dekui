@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <QEventLoop>
+#if !defined(Q_OS_VISIONOS) && !defined(Q_OS_TVOS)
 #include <QProcess>
+#endif
 #include <QStandardPaths>
 #include <QTimer>
 #include "mm3d/game_folder.h"
@@ -12,10 +14,20 @@ namespace MM3D::GameFolder {
 inline QString Prepare() {
     const auto rom=Rom();
     if(rom.isEmpty())return MissingGameMessage();
-    const auto helper=Root()+QStringLiteral("/tools/mm3d/graphical_setup.py");
+#if defined(Q_OS_VISIONOS) || defined(Q_OS_TVOS)
+    // visionOS and tvOS applications cannot spawn the bundled Python setup
+    // helper. Accept a user folder prepared by the desktop release until the
+    // resource transformation pipeline has a native implementation.
+    if(QFileInfo::exists(User()+QStringLiteral("setup/ready.json")))return {};
+#ifdef Q_OS_TVOS
+    return QStringLiteral("This Apple TV developer build needs a prepared Dekui user folder. Run Dekui setup on a desktop, then copy that user folder to the Apple TV with tools/tvos/copy-game.sh.");
+#endif
+    return QStringLiteral("This visionOS developer build needs a prepared Dekui user folder. Run Dekui setup on a desktop, then import that user folder with the game into Files > On My Apple Vision Pro > Dekui.");
+#else
+    const auto helper=InstallRoot()+QStringLiteral("/tools/mm3d/graphical_setup.py");
     if(!QFileInfo::exists(helper))return QStringLiteral("Setup files are missing. Extract the entire Dekui download and keep the app beside its tools and resources folders.");
 #ifdef Q_OS_WIN
-    const auto python=Root()+QStringLiteral("/runtime/python/python.exe");
+    const auto python=InstallRoot()+QStringLiteral("/runtime/python/python.exe");
     if(!QFileInfo(python).isFile())return QStringLiteral("The bundled setup runtime is missing. Extract the complete Dekui ZIP again, keeping its runtime folder beside Dekui.exe.");
 #elif defined(Q_OS_MACOS)
     const auto python=QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(QStringLiteral("../Resources/runtime/python/bin/python3"));
@@ -46,5 +58,6 @@ inline QString Prepare() {
     });
     loop.exec();
     return error;
+#endif
 }
 }

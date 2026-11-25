@@ -27,6 +27,7 @@
 #endif
 #include "mm3d/diagnostics.h"
 #include "mm3d/layout_reset.h"
+#include "mm3d/notice.h"
 #include "mm3d/classic_saving.h"
 #include "mm3d/classic_double_time.h"
 #include "mm3d/audio_capture.h"
@@ -86,7 +87,11 @@ QString SettingsBackupPath(const QString& directory,const QString& kind) {
     return folder+QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd_HH-mm-ss-zzz")+
         "-"+kind+"-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".json";
 }
-void ApplyFrameInterpolation(bool enabled, bool cpu_vertices) {
+void ApplyFrameInterpolation(bool enabled, bool requested_cpu_vertices) {
+    const bool cpu_vertices =
+        requested_cpu_vertices && CpuInterpolation::cpu_vertices_supported.load();
+    if (enabled && requested_cpu_vertices && !cpu_vertices)
+        LOG_WARNING(Render_Vulkan, "CPU interpolation needs the JIT; using GPU interpolation");
     CpuInterpolation::enabled.store(cpu_vertices);
     CameraMidpoint::enabled=enabled;
     CameraMidpoint::present_60=enabled;
@@ -97,9 +102,17 @@ void ApplyFrameInterpolation(bool enabled, bool cpu_vertices) {
     LinkPoseCapture::interpolate_actors=enabled;
     ++LinkPoseCapture::interpolation_generation;
     LinkPoseCapture::replaced_draws=0;LinkPoseCapture::replaced_bones=0;
+    // CPU interpolation forces hardware shaders off and GPU interpolation forces
+    // them on. Original leaves the user's own toggle alone, but undoes the CPU
+    // mode's override so switching back doesn't keep vertices on the CPU.
+    static bool forced_cpu_shading=false;
     if(enabled) {
         PlayerSettings::set_vsync.store(1);
-        PlayerSettings::set_hardware_shaders.store(CpuInterpolation::Enabled() ? 0 : 1);
+        PlayerSettings::set_hardware_shaders.store(cpu_vertices ? 0 : 1);
+        forced_cpu_shading=cpu_vertices;
+    } else if(forced_cpu_shading) {
+        PlayerSettings::set_hardware_shaders.store(1);
+        forced_cpu_shading=false;
     }
     LOG_INFO(Render_Vulkan, "Interpolation settings: enabled={} vertex_processing={}",
              enabled, cpu_vertices ? "CPU" : "GPU");
@@ -406,6 +419,8 @@ struct Overlay::Impl {
     double previous = Now();
     double startup_hint_start = -1;
     bool startup_hint_shown = false;
+    std::string notice;
+    double notice_start = -1;
     bool backend_ready{};
     std::mutex* submit_mutex{};
     vk::Sampler thumbnail_sampler{};
@@ -468,6 +483,11 @@ Overlay::Overlay(const Vulkan::Instance& instance, vk::Format format, unsigned i
     ImGui::SetCurrentContext(state.context);
     ImGui::GetIO().IniFilename = nullptr;
     ImGui::GetIO().LogFilename = nullptr;
+#if defined(CITRA_TVOS) || defined(CITRA_VISIONOS)
+    // Apple frontends feed controller presses as ImGui gamepad keys.
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    ImGui::GetIO().BackendFlags |= ImGuiBackendFlags_HasGamepad;
+#endif
     ImGui::StyleColorsDark();
     state.base_style=ImGui::GetStyle();
     const auto loader = [](const char* name, void* data) -> PFN_vkVoidFunction {
@@ -568,8 +588,10 @@ Overlay::~Overlay() {
     text_input.clear(); key_input.clear(); text_input_active.store(false);
 }
 void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
-                   unsigned width, unsigned height) {
+                   unsigned frame_width, unsigned height, unsigned eyes, bool immersive_hud) {
     auto& state = *impl;
+    eyes = std::max(1u, eyes);
+    const unsigned width = frame_width / eyes;
     if(const int hidden=HudAdjustments::minimap_visibility_request.exchange(-1);hidden>=0) {
         state.settings.player_hud.hide_minimap=hidden!=0;
         state.status=state.settings.Save(state.directory+"presentation.json")?"Minimap visibility saved":"Minimap visibility save FAILED";
@@ -616,7 +638,13 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
         const float fade=std::clamp(float((now-state.startup_hint_start-2.0)/2.0),0.f,1.f);
         const float alpha=1.f-fade*fade*(3.f-2.f*fade);
         if(alpha>0) {
+#ifdef CITRA_VISIONOS
+            constexpr const char* label="Game Options are below the window";
+#elif defined(CITRA_TVOS)
+            constexpr const char* label="Press Back on the remote or L3+R3 on a controller for Dekui's menu";
+#else
             constexpr const char* label="Press F1 to access settings";
+#endif
             const float scale=std::clamp(float(height)/720.f,.8f,3.f);
             const float font_size=18.f*scale,margin=16.f*scale,padding=8.f*scale;
             const auto size=ImGui::GetFont()->CalcTextSizeA(font_size,FLT_MAX,0,label);
@@ -628,6 +656,26 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
         } else state.startup_hint_start=-1;
     }
 #endif
+    if(auto text=Notice::Take()) {
+        state.notice=std::move(*text);
+        state.notice_start=now;
+    }
+    if(state.notice_start>=0) {
+        // Like the startup hint: hold briefly, then fade. Drawn above it.
+        const float fade=std::clamp(float((now-state.notice_start-1.5)/1.0),0.f,1.f);
+        const float alpha=1.f-fade*fade*(3.f-2.f*fade);
+        if(alpha>0) {
+            const float scale=std::clamp(float(height)/720.f,.8f,3.f);
+            const float font_size=18.f*scale,margin=16.f*scale,padding=8.f*scale;
+            const auto size=ImGui::GetFont()->CalcTextSizeA(font_size,FLT_MAX,0,state.notice.c_str());
+            const float lift=state.startup_hint_start>=0?size.y+3*padding:0.f;
+            const ImVec2 pos{margin+padding,float(height)-margin-padding-size.y-lift};
+            auto* draw=ImGui::GetForegroundDrawList();
+            draw->AddRectFilled({pos.x-padding,pos.y-padding},
+                {pos.x+size.x+padding,pos.y+size.y+padding},IM_COL32(0,0,0,int(145*alpha)),5.f*scale);
+            draw->AddText(ImGui::GetFont(),font_size,pos,IM_COL32(255,255,255,int(255*alpha)),state.notice.c_str());
+        } else state.notice_start=-1;
+    }
     if(PlayerOverlay()&&state.settings.show_performance) {
         ImGui::SetNextWindowPos({8,8});
         ImGui::SetNextWindowBgAlpha(.6f);
@@ -651,16 +699,26 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
     #endif
     if (overlay_visible.load()) {
         const float ui_scale=state.settings.scale;
-        const ImVec2 size{std::min(850.f*ui_scale,float(width)),std::min(680.f*ui_scale,float(height))};
+        const float safe_width = immersive_hud ? float(width)*.72f : float(width);
+        const float safe_height = immersive_hud ? float(height)*.78f : float(height);
+        const ImVec2 size{std::min(850.f*ui_scale,safe_width),
+                          std::min(680.f*ui_scale,safe_height)};
         const auto sizing=state.resize_settings_window?ImGuiCond_Always:ImGuiCond_FirstUseEver;
-        ImGui::SetNextWindowPos({std::min(20.f,std::max(0.f,float(width)-size.x)),
-            std::min(80.f,std::max(0.f,float(height)-size.y))},sizing);
-        ImGui::SetNextWindowSize(size,sizing);
+        const ImVec2 position = immersive_hud
+            ? ImVec2{std::max(0.f, (float(width)-size.x)*.5f),
+                     std::max(0.f, (float(height)-size.y)*.5f)}
+            : ImVec2{std::min(20.f,std::max(0.f,float(width)-size.x)),
+                     std::min(80.f,std::max(0.f,float(height)-size.y))};
+        ImGui::SetNextWindowPos(position, immersive_hud ? ImGuiCond_Always : sizing);
+        ImGui::SetNextWindowSize(size, immersive_hud ? ImGuiCond_Always : sizing);
         ImGui::SetNextWindowSizeConstraints({std::min(300.f*ui_scale,float(width)),
             std::min(200.f*ui_scale,float(height))},{float(width),float(height)});
         state.resize_settings_window=false;
 #if defined(__ANDROID__)
         ImGui::Begin("Dekui settings");
+#elif defined(ENABLE_MM3D_GAME_FOLDER) && (defined(CITRA_VISIONOS) || defined(CITRA_TVOS))
+        // Opened from the window's ornament (visionOS) or Dekui's menu (tvOS); keep the window's saved ImGui ID.
+        ImGui::Begin("Game Options###Dekui settings (F1)");
 #elif defined(ENABLE_MM3D_GAME_FOLDER)
         ImGui::Begin("Dekui settings (F1)");
 #else
@@ -704,7 +762,11 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
         };
         const auto startup_hint_control=[&]() {
 #ifndef __ANDROID__
+#if defined(CITRA_VISIONOS) || defined(CITRA_TVOS)
+            if(ImGui::Checkbox("Show Game Options hint",&state.settings.show_startup_settings_hint))
+#else
             if(ImGui::Checkbox("Show F1 settings hint",&state.settings.show_startup_settings_hint))
+#endif
                 state.status=state.settings.Save(state.directory+"presentation.json")?"Settings hint saved":"Settings hint save FAILED";
 #endif
         };
@@ -731,6 +793,9 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
             hover_help("Recommended interpolation option to avoid stutter");
             changed |= ImGui::RadioButton("60FPS GPU interpolation", &method, 2);
             hover_help("Better performance but worse stuttering, not recommended.");
+            if (method == 1 && !CpuInterpolation::cpu_vertices_supported.load())
+                ImGui::TextWrapped("CPU interpolation needs the JIT, which is unavailable. "
+                                   "Using GPU interpolation; launch through a JIT enabler for CPU interpolation.");
             if (changed) {
                 state.settings.interpolation_60fps = method != 0;
                 if (method != 0) state.settings.interpolation_cpu_vertices = method == 1;
@@ -960,34 +1025,100 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
         const auto cheats_controls=[&] {
             using namespace SimpleCheats;
             const bool available=ready.load();
-            ImGui::TextWrapped("Buttons apply once. Infinite cheats last for this session. Changes to your inventory can be saved with the game.");
+            ImGui::TextWrapped("Cheats apply when you resume the game. Infinite cheats last until you quit. Changes to your inventory are kept when you save.");
             if(!available)ImGui::TextWrapped("Load a save in the supported USA Restoration build to use cheats.");
+            if(Requested())ImGui::TextUnformatted("Queued — resume the game to apply.");
+            else if(result.load()==1)ImGui::TextUnformatted("Cheat applied.");
+            else if(result.load()==-2)ImGui::TextUnformatted("No room for that item: empty a bottle first.");
+            else if(result.load()==-1)ImGui::TextUnformatted("Not applied: load a supported game save first.");
+            const auto action=[&](Action a){if(ImGui::Button(Labels[a]))Queue(a);hover_help(Help[a]);};
             ImGui::BeginDisabled(!available);
-            for(unsigned i=0;i<Count;++i) {
-                if(i==0)ImGui::SeparatorText("Health, magic and rupees");
-                if(i==Masks)ImGui::SeparatorText("Inventory and gear");
-                if(ImGui::Button(Labels[i]))Queue(Action(i));
-                hover_help(Help[i]);
+            if(ImGui::CollapsingHeader("Warp",ImGuiTreeNodeFlags_DefaultOpen)) {
+                static int destination=0,form=0,time=0;
+                const auto& d=Destinations[destination];
+                if(ImGui::BeginCombo("Destination",d.name,ImGuiComboFlags_HeightLarge)) {
+                    for(unsigned r=0;r<RegionCount;++r) {
+                        ImGui::SeparatorText(RegionNames[r]);
+                        for(int i=0;i<int(std::size(Destinations));++i) {
+                            if(Destinations[i].region!=r)continue;
+                            ImGui::PushID(i);
+                            if(ImGui::Selectable(Destinations[i].name,i==destination))destination=i;
+                            if(i==destination)ImGui::SetItemDefaultFocus();
+                            ImGui::PopID();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::Combo("Arrive as",&form,FormNames.data(),int(FormNames.size()));
+                hover_help("Link arrives in this form. Fierce Deity works anywhere this way.");
+                ImGui::Combo("Arrive at",&time,TimeNames.data(),int(TimeNames.size()));
+                hover_help("Sets the clock before the area loads, so its people, sky and fog match. The day is unchanged.");
+                if(ImGui::Button("Warp"))
+                    warp=int(U32(Destinations[destination].group)<<9|FormChoices[form]<<16|U32(time)<<20);
+                hover_help("Arrives at the area's first entrance. Story events in some areas can play out of order or soft-lock; keep a save state.");
+            }
+            if(ImGui::CollapsingHeader("Boss rematch")) {
+                static int choice=0;
+                ImGui::Combo("Boss",&choice,[](void*,int i){return Bosses[i].name;},nullptr,int(Bosses.size()));
+                static bool keep=false;
+                if(ImGui::Checkbox("Keep the win",&keep))keep_boss_win=keep;
+                hover_help("Keeps the remains, heart container and cleared temple from the rematch. Otherwise they go back to what you had when you leave the lair.");
+                ImGui::BeginDisabled(boss_active.load());
+                if(ImGui::Button("Fight"))boss=choice;
+                ImGui::EndDisabled();
+                hover_help("Warps to the boss's lair with its temple counting as not cleared.");
+                if(boss_active.load())ImGui::TextUnformatted("Rematch under way. Leave the lair to end it.");
+            }
+            if(ImGui::CollapsingHeader("Health, magic and rupees")) {
+                action(Heal);ImGui::SameLine();action(Magic);
+                static int hearts=20;
+                ImGui::SliderInt("Heart containers",&hearts,3,20,"%d",ImGuiSliderFlags_AlwaysClamp);
+                ImGui::SameLine();
+                if(ImGui::Button("Set"))max_hearts=hearts;
+                hover_help("Sets maximum health and refills it.");
+                action(DoubleMagic);
+                action(FillWallet);ImGui::SameLine();action(Rupees0);
+                action(Bank5000);ImGui::SameLine();action(Bank0);
+            }
+            if(ImGui::CollapsingHeader("Inventory and gear")) {
+                action(Items);ImGui::SameLine();action(Masks);
+                static int item=0;
+                ImGui::Combo("Item",&item,[](void*,int i){return GiveItems[i].name;},nullptr,int(std::size(GiveItems)));
+                ImGui::SameLine();
+                if(ImGui::Button("Give"))give_item=GiveItems[item].id;
+                hover_help("Adds the item to its inventory slot. Bottle contents fill an empty bottle, or a bottle slot you don't have yet. Trade items replace what is in their slot.");
+                for(Action a:{Gilded,Razor,Bags,Songs,Fairies})action(a);
+                action(GreatFairySwordB);ImGui::SameLine();action(FierceDeityB);
+            }
+            if(ImGui::CollapsingHeader("Time")) {
+                static const char* times[]={"6:00 AM","Noon","6:00 PM","Midnight"};
+                for(int i=0;i<4;++i){if(i)ImGui::SameLine();if(ImGui::Button(times[i]))set_time=int(TimeValues[i+1]);}
+                for(int day=1;day<=3;++day) {
+                    if(day>1)ImGui::SameLine();
+                    if(ImGui::Button(day==1?"Day 1":day==2?"Day 2":"Final Day"))set_day=day;
+                }
+                help_text("People, sky and fog catch up when you enter another area. Warp to set the time on arrival instead.");
+            }
+            if(ImGui::CollapsingHeader("Minigames")) {
+                action(BomberCode);action(Lottery);
             }
             ImGui::EndDisabled();
-            ImGui::SeparatorText("Infinite resources");
-            for(unsigned i=0;i<9;++i) {
-                const U32 bit=1u<<i;
-                bool on=(continuous.load()&bit)!=0;
-                // Enabled cheats can always be turned off, even on the title screen.
-                ImGui::BeginDisabled(!available&&!on);
-                const char* label=i<7?Ammunition[i].label:i==7?"Infinite health":"Infinite magic";
-                if(ImGui::Checkbox(label,&on)) {
-                    if(on)continuous.fetch_or(bit);else continuous.fetch_and(~bit);
+            if(ImGui::CollapsingHeader("Infinite and continuous",ImGuiTreeNodeFlags_DefaultOpen)) {
+                for(unsigned i=0;i<ToggleCount;++i) {
+                    const U32 bit=1u<<i;
+                    bool on=(continuous.load()&bit)!=0;
+                    // Enabled cheats can always be turned off, even on the title screen.
+                    ImGui::BeginDisabled(!available&&!on);
+                    const char* label=i<Ammunition.size()?Ammunition[i].label:Toggles[i-InfiniteHealth].first;
+                    if(ImGui::Checkbox(label,&on)) {
+                        if(on)continuous.fetch_or(bit);else continuous.fetch_and(~bit);
+                    }
+                    hover_help(i<Ammunition.size()?"Keeps this ammo stocked while you own the item. Turning it off stops refills.":
+                        Toggles[i-InfiniteHealth].second);
+                    ImGui::EndDisabled();
                 }
-                hover_help(i<7?"Keeps this ammo stocked while you own the item. Turning it off stops refills.":
-                    "Refills to your current capacity. Turning it off stops refills.");
-                ImGui::EndDisabled();
+                if(ImGui::Button("Turn off all infinite cheats"))continuous=0;
             }
-            if(ImGui::Button("Turn off all infinite cheats"))continuous=0;
-            if(pending.load())ImGui::TextUnformatted("Queued — resume the game to apply.");
-            else if(result.load()==1)ImGui::TextUnformatted("Cheat applied.");
-            else if(result.load()==-1)ImGui::TextUnformatted("Not applied: load a supported game save first.");
         };
         const auto restoration_controls=[&] {
             if(ImGui::Checkbox("Bombers don't approach automatically",&state.settings.disable_bomber_approach)) {
@@ -1086,6 +1217,7 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
             if(ImGui::BeginTabItem("Difficulty")){difficulty_controls();ImGui::EndTabItem();}
             if(ImGui::BeginTabItem("Restoration")){restoration_controls();ImGui::EndTabItem();}
             if(ImGui::BeginTabItem("QOL")){qol_controls();ImGui::EndTabItem();}
+            if(ImGui::BeginTabItem("Cheats")){cheats_controls();ImGui::EndTabItem();}
 #ifndef __ANDROID__
             // Opt-in support tools for packaged builds. Never persist this flag in
             // presentation.json or expose the editor's game-modifying controls.
@@ -1127,11 +1259,26 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
             if(ImGui::BeginTabItem("Controls")) {
                 text_controls();
                 if(ImGui::Button("Configure controller / keyboard"))PlayerSettings::controls.store(true);
+                {
+                    // Settings::MotionSource order; head tracking only where a frontend provides it.
+                    const char* sources[]={"Off","Controller gyro","Head tracking"};
+                    const int count=head_motion_available.load()?3:2;
+                    int source=set_motion_source.load();if(source<0)source=motion_source.load();
+                    if(ImGui::Combo("Motion controls",&source,sources,count))set_motion_source.store(source);
+                    hover_help("Feeds a controller's gyroscope (DualSense, DualShock 4, Switch Pro and others) into the 3DS motion sensors, for gyro aiming in first person with the bow, hookshot and other items. Turn the controller as you would turn a 3DS.");
+                    int sensitivity=set_motion_sensitivity.load();if(sensitivity<0)sensitivity=motion_sensitivity.load();
+                    ImGui::BeginDisabled(source==0);
+                    if(ImGui::SliderInt("Motion sensitivity",&sensitivity,25,400,"%d%%",ImGuiSliderFlags_AlwaysClamp))
+                        set_motion_sensitivity.store(sensitivity);
+                    ImGui::EndDisabled();
+                    hover_help("How far the view turns for each degree you turn the controller. 100% matches a real 3DS.");
+                }
 #ifndef __ANDROID__
+                if(ImGui::Button("Save states..."))PlayerSettings::save_states.store(true);
                 if(ImGui::Button("Fullscreen shortcut..."))PlayerSettings::fullscreen_shortcut.store(true);
                 if(ImGui::Button("Custom textures shortcut..."))PlayerSettings::textures_shortcut.store(true);
 #endif
-                help_text("Hold ZR and press SELECT during gameplay to hide or show the minimap. Game touchscreen input is disabled.");
+                help_text("Hold ZR and press SELECT during gameplay to hide or show the minimap. Hold ZR and press D-Pad Down to save a new state, or D-Pad Up to load the newest one. Game touchscreen input is disabled.");
                 ImGui::EndTabItem();
             }
             if(ImGui::BeginTabItem("About")) {
@@ -1284,6 +1431,7 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
             text_controls();
             if(ImGui::Button("Configure controller / keyboard"))PlayerSettings::controls.store(true);
 #ifndef __ANDROID__
+                if(ImGui::Button("Save states..."))PlayerSettings::save_states.store(true);
                 if(ImGui::Button("Fullscreen shortcut..."))PlayerSettings::fullscreen_shortcut.store(true);
                 if(ImGui::Button("Custom textures shortcut..."))PlayerSettings::textures_shortcut.store(true);
 #endif
@@ -1291,7 +1439,7 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
         }
         if(ImGui::BeginTabItem("Restoration")){restoration_controls();ImGui::EndTabItem();}
         if(ImGui::BeginTabItem("QOL")){qol_controls();ImGui::EndTabItem();}
-            if(ImGui::BeginTabItem("Cheats")){cheats_controls();ImGui::EndTabItem();}
+        if(ImGui::BeginTabItem("Cheats")){cheats_controls();ImGui::EndTabItem();}
         if(ImGui::BeginTabItem("Editor")) {
         ImGui::TextUnformatted("MM3D presentation editor");
         if(ImGui::CollapsingHeader("Settings backups")) {
@@ -1334,7 +1482,7 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
         }
         if(state.settings.widescreen) {
             ImGui::Text("Top-screen draws corrected last frame: %u",Widescreen::corrected_draws.load());
-            if(!Widescreen::supported_layout.load()) ImGui::TextWrapped("Requires a landscape top screen with stereoscopic 3D disabled.");
+            if(!Widescreen::supported_layout.load()) ImGui::TextWrapped("Requires a landscape top screen, with stereoscopic 3D off or side by side.");
             ImGui::TextWrapped("Keeps HUD and text centered at their original proportions. Check scene edges, menus and transitions; some full-screen effects may need exceptions.");
         }
         bool zoom_changed = ImGui::SliderFloat("Camera zoom out (experimental)",
@@ -1353,7 +1501,7 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
         if(state.settings.camera_zoom_out > 1.f) {
             ImGui::TextWrapped("Widens the world view; 1.00x restores the original FOV. Experimental depth-based filtering may miss effects or affect some UI. Objects may disappear near the edges.");
             if(!Widescreen::supported_layout.load())
-                ImGui::TextWrapped("Requires a landscape top screen with stereoscopic 3D disabled.");
+                ImGui::TextWrapped("Requires a landscape top screen, with stereoscopic 3D off or side by side.");
         }
         if(ImGui::CollapsingHeader("Minimap")) {
             bool changed=ImGui::Checkbox("Show minimap",&state.settings.minimap);
@@ -2784,11 +2932,17 @@ void Overlay::Draw(vk::CommandBuffer command, vk::Framebuffer framebuffer,
     }
     ImGui::Render();
     text_input_active.store(overlay_visible.load() && io.WantTextInput);
-    const vk::RenderPassBeginInfo begin{.renderPass = state.renderpass, .framebuffer = framebuffer,
-        .renderArea = {{0, 0}, {width, height}}};
-    command.beginRenderPass(begin, vk::SubpassContents::eInline);
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), command);
-    command.endRenderPass();
+    // The same draw data in each eye puts the GUI at the screen's depth.
+    for (unsigned eye = 0; eye < eyes; ++eye) {
+        const int offset = int(eye * width);
+        const vk::RenderPassBeginInfo begin{.renderPass = state.renderpass,
+            .framebuffer = framebuffer, .renderArea = {{offset, 0}, {width, height}}};
+        ImGui_ImplVulkan_SetViewportOffsetX(offset);
+        command.beginRenderPass(begin, vk::SubpassContents::eInline);
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), command);
+        command.endRenderPass();
+    }
+    ImGui_ImplVulkan_SetViewportOffsetX(0);
 }
 void Overlay::Presented() {
     if(ClassicSaving::exit_black_rendered.exchange(false)) {
